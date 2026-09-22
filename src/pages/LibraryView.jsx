@@ -13,25 +13,53 @@ import {
   MapPin,
   Calendar,
   Trash2,
-  Loader2
+  Loader2,
+  AlertTriangle
 } from 'lucide-react';
 
+// Tanggal lokal (bukan UTC) agar konsisten dengan tanggal "hari ini" di server.
+const toLocalDateString = (date = new Date()) => {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+const getDefaultDueDate = () => {
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  return toLocalDateString(d);
+};
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
+
 export default function LibraryView() {
-  const { currentUser, currentRole, showToast } = useAuth();
+  const { currentUser, currentRole, canAccess, showToast } = useAuth();
+  const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  // Aksi tulis katalog (tambah/hapus judul) hanya untuk pengelola, bukan akun siswa/ortu.
+  const canManageCatalog = canAccess('library') && !isStudentAccount;
+  // Data induk siswa/guru hanya dimuat bila akun punya modul buku_induk (hindari 403).
+  const canPickBorrower = canAccess('buku_induk');
   const [activeTab, setActiveTab] = useState('catalog'); // 'catalog' or 'loans'
   const [books, setBooks] = useState([]);
   const [loans, setLoans] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Semua');
 
   // Modal Pinjam
   const [borrowModal, setBorrowModal] = useState({ open: false, book: null });
-  const [borrowerName, setBorrowerName] = useState('Aditya Pratama Putra');
-  const [borrowDueDate, setBorrowDueDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 7);
-    return d.toISOString().split('T')[0];
-  });
+  const [borrowerType, setBorrowerType] = useState('siswa');
+  const [borrowerId, setBorrowerId] = useState('');
+  const [borrowerName, setBorrowerName] = useState('');
+  const [borrowDueDate, setBorrowDueDate] = useState(getDefaultDueDate);
+  const [isBorrowing, setIsBorrowing] = useState(false);
+  const [borrowerOptions, setBorrowerOptions] = useState({ siswa: [], guru: [], loaded: false });
 
   // Modal Tambah Buku
   const [showAddModal, setShowAddModal] = useState(false);
@@ -43,17 +71,15 @@ export default function LibraryView() {
   const [newShelf, setNewShelf] = useState('Rak A-02');
 
   const fetchBooks = () => {
-    fetch('/api/library/books')
-      .then(res => res.json())
-      .then(data => setBooks(data))
-      .catch(() => {});
+    fetchJson('/api/library/books')
+      .then(data => { setBooks(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setBooks([]); setLoadError(err.message || 'Katalog buku tidak dapat dimuat.'); });
   };
 
   const fetchLoans = () => {
-    fetch('/api/library/loans')
-      .then(res => res.json())
-      .then(data => setLoans(data))
-      .catch(() => {});
+    fetchJson('/api/library/loans')
+      .then(data => setLoans(Array.isArray(data) ? data : []))
+      .catch(err => { setLoans([]); setLoadError(prev => prev || err.message || 'Data peminjaman tidak dapat dimuat.'); });
   };
 
   useEffect(() => {
@@ -61,48 +87,85 @@ export default function LibraryView() {
     fetchLoans();
   }, []);
 
-  const handleBorrowSubmit = (e) => {
-    e.preventDefault();
-    if (!borrowModal.book) return;
-
-    fetch('/api/library/loans', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        book_id: borrowModal.book.id,
-        borrower_type: 'siswa',
-        borrower_id: 1,
-        borrower_name: borrowerName,
-        borrow_date: new Date().toISOString().split('T')[0],
-        due_date: borrowDueDate,
-        notes: 'Peminjaman mandiri via portal digital'
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          showToast(data.message, 'success');
-          setBorrowModal({ open: false, book: null });
-          fetchBooks();
-          fetchLoans();
-        } else {
-          showToast(data.message, 'error');
-        }
-      })
-      .catch(() => showToast('Gagal memproses peminjaman', 'error'));
+  // Muat daftar siswa/guru dari data induk (sekali) agar peminjam tercatat dengan ID yang benar.
+  const loadBorrowerOptions = () => {
+    if (!canPickBorrower || borrowerOptions.loaded) return;
+    Promise.all([
+      fetchJson('/api/master/students').catch(() => []),
+      fetchJson('/api/master/teachers').catch(() => []),
+    ]).then(([students, teachers]) => {
+      setBorrowerOptions({
+        siswa: Array.isArray(students) ? students.filter(s => String(s.status || 'aktif').toLowerCase() === 'aktif') : [],
+        guru: Array.isArray(teachers) ? teachers : [],
+        loaded: true,
+      });
+    });
   };
 
-  const handleReturnBook = (loanId) => {
-    fetch(`/api/library/loans/${loanId}/return`, { method: 'POST' })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          showToast(data.message, 'success');
-          fetchBooks();
-          fetchLoans();
-        }
-      })
-      .catch(() => showToast('Gagal mengembalikan buku', 'error'));
+  const openBorrowModal = (book) => {
+    setBorrowerType('siswa');
+    setBorrowerId(isStudentAccount && currentUser.related_student_id ? String(currentUser.related_student_id) : '');
+    setBorrowerName(currentRole === 'siswa' ? currentUser.name : '');
+    setBorrowDueDate(getDefaultDueDate());
+    setBorrowModal({ open: true, book });
+    loadBorrowerOptions();
+  };
+
+  const handleBorrowerTypeChange = (type) => {
+    setBorrowerType(type);
+    setBorrowerId('');
+    setBorrowerName('');
+  };
+
+  const handleBorrowerPick = (value) => {
+    setBorrowerId(value);
+    const person = (borrowerOptions[borrowerType] || []).find(p => String(p.id) === String(value));
+    setBorrowerName(person ? person.name : '');
+  };
+
+  const handleBorrowSubmit = async (e) => {
+    e.preventDefault();
+    if (!borrowModal.book || isBorrowing) return;
+    const name = borrowerName.trim();
+    const today = toLocalDateString();
+    if (!name) return showToast('Nama peminjam wajib diisi.', 'error');
+    if (!borrowDueDate || borrowDueDate < today) return showToast('Batas pengembalian tidak boleh sebelum hari ini.', 'error');
+
+    setIsBorrowing(true);
+    try {
+      const data = await fetchJson('/api/library/loans', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          book_id: borrowModal.book.id,
+          borrower_type: borrowerType,
+          borrower_id: Number(borrowerId) || 0,
+          borrower_name: name,
+          borrow_date: today,
+          due_date: borrowDueDate,
+          notes: `Peminjaman dicatat oleh ${currentUser.name} via portal digital`
+        })
+      });
+      showToast(data.message || 'Peminjaman buku berhasil dicatat.', 'success');
+      setBorrowModal({ open: false, book: null });
+      fetchBooks();
+      fetchLoans();
+    } catch (err) {
+      showToast(err.message || 'Gagal memproses peminjaman', 'error');
+    } finally {
+      setIsBorrowing(false);
+    }
+  };
+
+  const handleReturnBook = async (loanId) => {
+    try {
+      const data = await fetchJson(`/api/library/loans/${loanId}/return`, { method: 'POST' });
+      showToast(data.message || 'Buku berhasil dikembalikan.', data.already_returned ? 'info' : 'success');
+      fetchBooks();
+      fetchLoans();
+    } catch (err) {
+      showToast(err.message || 'Gagal mengembalikan buku', 'error');
+    }
   };
 
   const handleAddBook = async (e) => {
@@ -112,60 +175,59 @@ export default function LibraryView() {
 
     setIsSubmitting(true);
     try {
-      const res = await fetch('/api/library/books', {
+      // ISBN dikosongkan: server membangkitkan ISBN unik sendiri (menghindari bentrok UNIQUE).
+      const data = await fetchJson('/api/library/books', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          isbn: `978-602-${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}`,
           title: newTitle.trim(),
           author: newAuthor.trim(),
           publisher: 'Pustaka Pendidikan',
           category: newCategory,
-          total_copies: Number(newTotal) || 1,
+          total_copies: Math.max(1, Number(newTotal) || 1),
           shelf_location: newShelf.trim() || 'Rak Umum',
           cover_url: 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=300',
-          year_published: 2024
+          year_published: new Date().getFullYear()
         })
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message || 'Buku berhasil ditambahkan!', 'success');
-        setShowAddModal(false);
-        setNewTitle('');
-        setNewAuthor('');
-        fetchBooks();
-      } else {
-        showToast(data.message || 'Gagal menambahkan buku', 'error');
-      }
+      showToast(data.message || 'Buku berhasil ditambahkan!', 'success');
+      setShowAddModal(false);
+      setNewTitle('');
+      setNewAuthor('');
+      fetchBooks();
     } catch (err) {
-      showToast('Koneksi ke server gagal: ' + err.message, 'error');
+      showToast(err.message || 'Gagal menambahkan buku', 'error');
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleDeleteBook = async (bookId, title) => {
-    if (!window.confirm(`Hapus buku "${title}" dari katalog perpustakaan?`)) return;
+    const hasActiveLoan = loans.some(l => l.book_id === bookId && l.status === 'dipinjam');
+    const warning = hasActiveLoan ? '\n\nPerhatian: masih ada peminjaman aktif untuk buku ini; riwayat peminjamannya ikut terhapus.' : '';
+    if (!window.confirm(`Hapus buku "${title}" dari katalog perpustakaan?${warning}`)) return;
     try {
-      const res = await fetch(`/api/library/books/${bookId}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message || 'Buku berhasil dihapus', 'success');
-        fetchBooks();
-        fetchLoans();
-      } else {
-        showToast(data.message || 'Gagal menghapus buku', 'error');
-      }
+      const data = await fetchJson(`/api/library/books/${bookId}`, { method: 'DELETE' });
+      showToast(data.message || 'Buku berhasil dihapus', 'success');
+      fetchBooks();
+      fetchLoans();
     } catch (err) {
-      showToast('Gagal menghapus buku', 'error');
+      showToast(err.message || 'Gagal menghapus buku', 'error');
     }
   };
 
+  const today = toLocalDateString();
+  const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredBooks = books.filter(b => {
-    const matchSearch = b.title.toLowerCase().includes(searchTerm.toLowerCase()) || b.author.toLowerCase().includes(searchTerm.toLowerCase());
+    const haystack = `${b.title || ''} ${b.author || ''} ${b.isbn || ''}`.toLowerCase();
+    const matchSearch = !normalizedSearch || haystack.includes(normalizedSearch);
     const matchCat = selectedCategory === 'Semua' || b.category === selectedCategory;
     return matchSearch && matchCat;
   });
+  const activeLoans = loans.filter(l => l.status === 'dipinjam');
+  const overdueLoans = activeLoans.filter(l => l.due_date && l.due_date < today);
+  const totalAvailable = books.reduce((acc, b) => acc + (Number(b.available_copies) || 0), 0);
+  const borrowerList = borrowerOptions[borrowerType] || [];
 
   return (
     <div className="space-y-6 pb-16">
@@ -181,7 +243,7 @@ export default function LibraryView() {
         </div>
 
         <div className="flex items-center gap-2">
-          {currentRole !== 'siswa' && currentRole !== 'ortu' && (
+          {canManageCatalog && (
             <button
               onClick={() => setShowAddModal(true)}
               className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white text-xs font-semibold shadow-xs transition-colors"
@@ -191,6 +253,12 @@ export default function LibraryView() {
           )}
         </div>
       </div>
+
+      {loadError && (
+        <div className="flex items-center gap-2 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold">
+          <AlertTriangle className="w-4 h-4 shrink-0" /> {loadError}
+        </div>
+      )}
 
       {/* STATS TILES */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -212,7 +280,7 @@ export default function LibraryView() {
           <div>
             <div className="text-[10px] text-slate-400 uppercase font-bold">Stok Eksemplar</div>
             <div className="text-lg font-black text-[#002147]">
-              {books.reduce((acc, b) => acc + b.available_copies, 0)} <span className="text-xs font-normal text-slate-500">Eksemplar</span>
+              {totalAvailable} <span className="text-xs font-normal text-slate-500">Eksemplar</span>
             </div>
             <div className="text-[10px] text-emerald-600 font-semibold">Siap dipinjam</div>
           </div>
@@ -225,9 +293,11 @@ export default function LibraryView() {
           <div>
             <div className="text-[10px] text-slate-400 uppercase font-bold">Sedang Dipinjam</div>
             <div className="text-lg font-black text-[#002147]">
-              {loans.filter(l => l.status === 'dipinjam').length} Buku
+              {activeLoans.length} Buku
             </div>
-            <div className="text-[10px] text-slate-500">Sirkulasi aktif saat ini</div>
+            <div className={`text-[10px] ${overdueLoans.length ? 'text-rose-600 font-semibold' : 'text-slate-500'}`}>
+              {overdueLoans.length ? `${overdueLoans.length} melewati batas kembali` : 'Sirkulasi aktif saat ini'}
+            </div>
           </div>
         </div>
 
@@ -290,6 +360,7 @@ export default function LibraryView() {
               <option value="Fiksi & Sastra">Fiksi & Sastra</option>
               <option value="Referensi">Referensi</option>
               <option value="Sejarah">Sejarah</option>
+              <option value="Agama & Karakter">Agama & Karakter</option>
             </select>
           </div>
 
@@ -306,7 +377,7 @@ export default function LibraryView() {
                       <span className="text-[10px] text-slate-400 font-mono flex items-center gap-1">
                         <MapPin className="w-3 h-3 text-slate-400" /> {b.shelf_location}
                       </span>
-                      {currentRole !== 'siswa' && (
+                      {canManageCatalog && (
                         <button
                           onClick={() => handleDeleteBook(b.id, b.title)}
                           title="Hapus Buku"
@@ -331,7 +402,7 @@ export default function LibraryView() {
                   </div>
                   <button
                     disabled={b.available_copies <= 0}
-                    onClick={() => setBorrowModal({ open: true, book: b })}
+                    onClick={() => openBorrowModal(b)}
                     className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
                       b.available_copies > 0
                         ? 'bg-[#002147] hover:bg-[#0a2f5c] text-white shadow-xs'
@@ -344,6 +415,15 @@ export default function LibraryView() {
               </div>
             ))}
           </div>
+
+          {filteredBooks.length === 0 && (
+            <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-10 text-center">
+              <BookOpen className="w-10 h-10 mx-auto text-slate-300 mb-2" />
+              <p className="text-sm font-bold text-slate-600">
+                {books.length === 0 ? 'Katalog buku masih kosong.' : 'Tidak ada buku yang cocok dengan pencarian/kategori.'}
+              </p>
+            </div>
+          )}
         </div>
       )}
 
@@ -367,7 +447,14 @@ export default function LibraryView() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {loans.map((l, idx) => (
+                {loans.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="py-8 text-center text-slate-400 text-xs">Belum ada catatan peminjaman.</td>
+                  </tr>
+                )}
+                {loans.map((l, idx) => {
+                  const isOverdue = l.status === 'dipinjam' && l.due_date && l.due_date < today;
+                  return (
                   <tr key={l.id} className="hover:bg-slate-50 transition-colors">
                     <td className="py-3.5 px-4 font-semibold text-slate-400">{idx + 1}</td>
                     <td className="py-3.5 px-4 font-bold text-[#002147]">{l.book_title}</td>
@@ -376,12 +463,12 @@ export default function LibraryView() {
                       <div className="text-[10px] text-slate-400 capitalize">{l.borrower_type}</div>
                     </td>
                     <td className="py-3.5 px-3 text-center font-mono text-[11px]">{l.borrow_date}</td>
-                    <td className="py-3.5 px-3 text-center font-mono text-[11px] font-bold text-amber-700">{l.due_date}</td>
+                    <td className={`py-3.5 px-3 text-center font-mono text-[11px] font-bold ${isOverdue ? 'text-rose-700' : 'text-amber-700'}`}>{l.due_date}</td>
                     <td className="py-3.5 px-3 text-center">
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                        l.status === 'dikembalikan' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                        l.status === 'dikembalikan' ? 'bg-emerald-100 text-emerald-800' : isOverdue ? 'bg-rose-100 text-rose-800' : 'bg-amber-100 text-amber-800'
                       }`}>
-                        {l.status}
+                        {isOverdue ? 'terlambat' : l.status}
                       </span>
                     </td>
                     <td className="py-3.5 px-4 text-center">
@@ -393,11 +480,12 @@ export default function LibraryView() {
                           Kembalikan
                         </button>
                       ) : (
-                        <span className="text-[11px] text-slate-400">Selesai ({l.return_date})</span>
+                        <span className="text-[11px] text-slate-400">Selesai{l.return_date ? ` (${l.return_date})` : ''}</span>
                       )}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -417,14 +505,48 @@ export default function LibraryView() {
 
             <form onSubmit={handleBorrowSubmit} className="space-y-3 text-xs">
               <div>
+                <label className="block text-slate-600 font-semibold mb-1">Tipe Peminjam</label>
+                <select
+                  value={borrowerType}
+                  onChange={(e) => handleBorrowerTypeChange(e.target.value)}
+                  disabled={isStudentAccount}
+                  className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 bg-white disabled:bg-slate-50"
+                >
+                  <option value="siswa">Siswa</option>
+                  <option value="guru">Guru / Tenaga Kependidikan</option>
+                </select>
+              </div>
+
+              <div>
                 <label className="block text-slate-600 font-semibold mb-1">Nama Peminjam</label>
-                <input
-                  type="text"
-                  value={borrowerName}
-                  onChange={(e) => setBorrowerName(e.target.value)}
-                  className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
-                  required
-                />
+                {canPickBorrower && borrowerList.length > 0 && !isStudentAccount ? (
+                  <select
+                    value={borrowerId}
+                    onChange={(e) => handleBorrowerPick(e.target.value)}
+                    className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 bg-white"
+                    required
+                  >
+                    <option value="">-- Pilih {borrowerType === 'siswa' ? 'siswa' : 'guru/staf'} dari data induk --</option>
+                    {borrowerList.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}{p.class_name ? ` — ${p.class_name}` : p.nip ? ` — NIP ${p.nip}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={borrowerName}
+                    onChange={(e) => setBorrowerName(e.target.value)}
+                    placeholder="Nama lengkap peminjam"
+                    readOnly={currentRole === 'siswa'}
+                    className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 read-only:bg-slate-50"
+                    required
+                  />
+                )}
+                {canPickBorrower && !borrowerOptions.loaded && !isStudentAccount && (
+                  <p className="text-[10px] text-slate-400 mt-1">Memuat data induk peminjam…</p>
+                )}
               </div>
 
               <div>
@@ -432,6 +554,7 @@ export default function LibraryView() {
                 <input
                   type="date"
                   value={borrowDueDate}
+                  min={today}
                   onChange={(e) => setBorrowDueDate(e.target.value)}
                   className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
                   required
@@ -448,9 +571,10 @@ export default function LibraryView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white font-semibold"
+                  disabled={isBorrowing}
+                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] disabled:opacity-50 text-white font-semibold"
                 >
-                  Konfirmasi Pinjam
+                  {isBorrowing ? 'Memproses...' : 'Konfirmasi Pinjam'}
                 </button>
               </div>
             </form>

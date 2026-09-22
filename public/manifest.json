@@ -1,12 +1,14 @@
 {
-  "name": "Sekolah Super App & CBT",
+  "name": "SMAN 1 Harapan Bangsa - Sekolah Super App & CBT",
   "short_name": "SekolahApp",
   "description": "Sistem Informasi Manajemen Sekolah Terpadu & CBT Anti-Nyontek",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#0f172a",
-  "theme_color": "#16a34a",
+  "background_color": "#f8fafc",
+  "theme_color": "#002147",
   "orientation": "any",
+  "lang": "id",
   "icons": [
     {
       "src": "/icon.svg",

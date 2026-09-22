@@ -16,9 +16,25 @@ import {
   X 
 } from 'lucide-react';
 
+// Batasan yang sama dengan server (/api/upload): JPG/PNG/WEBP, maksimal 5 MB.
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const DEFAULT_COVER = 'https://images.unsplash.com/photo-1455390582262-044cdead277a?w=800';
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
+
 export default function BlogView() {
-  const { currentUser, showToast } = useAuth();
+  const { currentUser, canAccess, showToast } = useAuth();
+  // Menerbitkan artikel memerlukan modul 'broadcast' di server; tamu & peran lain hanya membaca.
+  const canWriteBlog = canAccess('broadcast');
   const [blogs, setBlogs] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [selectedBlog, setSelectedBlog] = useState(null);
 
@@ -33,7 +49,9 @@ export default function BlogView() {
   const [isUploading, setIsUploading] = useState(false);
 
   const loadBlogs = () => {
-    fetch('/api/blogs').then(r => r.json()).then(setBlogs).catch(() => {});
+    fetchJson('/api/blogs')
+      .then(data => { setBlogs(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setBlogs([]); setLoadError(err.message || 'Artikel belum dapat dimuat.'); });
   };
 
   useEffect(() => {
@@ -42,29 +60,43 @@ export default function BlogView() {
 
   const handleFileChange = (e) => {
     const file = e.target.files?.[0];
+    e.target.value = ''; // izinkan memilih file yang sama lagi setelah dihapus
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      return showToast('Harap pilih file gambar (JPG, PNG, WEBP)', 'error');
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      return showToast('Format tidak didukung. Gunakan JPG, PNG, atau WEBP.', 'error');
     }
-    if (file.size > 25 * 1024 * 1024) {
-      return showToast('Ukuran gambar maksimal 25 MB', 'error');
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return showToast('Ukuran gambar maksimal 5 MB.', 'error');
     }
     setSelectedFile(file);
     const reader = new FileReader();
     reader.onload = () => setPreviewImage(reader.result);
+    reader.onerror = () => showToast('File gambar tidak dapat dibaca.', 'error');
     reader.readAsDataURL(file);
+  };
+
+  const resetForm = () => {
+    setTitle('');
+    setContent('');
+    setCoverImage('');
+    setSelectedFile(null);
+    setPreviewImage('');
   };
 
   const handleCreateBlog = async (e) => {
     e.preventDefault();
-    if (!title || !content) return showToast('Judul dan isi artikel tidak boleh kosong', 'error');
+    if (isUploading) return;
+    if (!canWriteBlog) return showToast('Akun Anda tidak memiliki hak untuk menerbitkan artikel.', 'error');
+    const cleanTitle = title.trim();
+    const cleanContent = content.trim();
+    if (!cleanTitle || !cleanContent) return showToast('Judul dan isi artikel tidak boleh kosong', 'error');
 
-    let finalCover = coverImage;
-
-    if (uploadMode === 'file' && previewImage) {
-      setIsUploading(true);
-      try {
-        const upRes = await fetch('/api/upload', {
+    setIsUploading(true);
+    try {
+      let finalCover = uploadMode === 'url' ? coverImage.trim() : '';
+      if (uploadMode === 'file' && previewImage) {
+        // Gagal unggah harus menghentikan proses, bukan diam-diam memakai cover bawaan.
+        const upData = await fetchJson('/api/upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -72,40 +104,28 @@ export default function BlogView() {
             filename: selectedFile?.name || 'cover.jpg'
           })
         });
-        const upData = await upRes.json();
-        if (upData.success) {
-          finalCover = upData.url;
-        }
-      } catch (err) {
-        setIsUploading(false);
-        return showToast('Gagal mengunggah cover foto: ' + err.message, 'error');
+        if (!upData.url) throw new Error('Server tidak mengembalikan alamat file cover.');
+        finalCover = upData.url;
       }
-    }
 
-    try {
-      const res = await fetch('/api/blogs', {
+      const data = await fetchJson('/api/blogs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title,
-          content,
+          title: cleanTitle,
+          content: cleanContent,
           author_name: currentUser.name,
-          author_role: currentUser.title || 'Civitas Akademika',
+          author_role: currentUser.title || currentUser.badge || 'Civitas Akademika',
           category,
-          cover_image: finalCover || 'https://images.unsplash.com/photo-1455390582262-044cdead277a?w=800'
+          cover_image: finalCover || DEFAULT_COVER
         })
       });
-      const data = await res.json();
       showToast(data.message || 'Artikel berhasil dipublikasikan!', 'success');
       setShowCreateModal(false);
-      setTitle('');
-      setContent('');
-      setCoverImage('');
-      setSelectedFile(null);
-      setPreviewImage('');
+      resetForm();
       loadBlogs();
     } catch (err) {
-      showToast('Gagal mempublikasikan artikel: ' + err.message, 'error');
+      showToast(err.message || 'Gagal mempublikasikan artikel', 'error');
     } finally {
       setIsUploading(false);
     }
@@ -126,12 +146,14 @@ export default function BlogView() {
           </p>
         </div>
 
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="px-4 py-2.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shadow-md shadow-[#002147]/20 flex items-center gap-2 transition-all cursor-pointer"
-        >
-          <Plus className="w-4 h-4 text-[#f4a024]" /> Tulis Karya Baru
-        </button>
+        {canWriteBlog && (
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="px-4 py-2.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shadow-md shadow-[#002147]/20 flex items-center gap-2 transition-all cursor-pointer"
+          >
+            <Plus className="w-4 h-4 text-[#f4a024]" /> Tulis Karya Baru
+          </button>
+        )}
       </div>
 
       {/* Grid Artikel */}
@@ -144,7 +166,7 @@ export default function BlogView() {
           >
             <div className="relative overflow-hidden h-44">
               <img
-                src={b.cover_image}
+                src={b.cover_image || DEFAULT_COVER}
                 alt={b.title}
                 className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
               />
@@ -168,13 +190,23 @@ export default function BlogView() {
                   ✍️ {b.author_name}
                 </span>
                 <span className="flex items-center gap-1 text-slate-500">
-                  <Eye className="w-3.5 h-3.5" /> {b.views || 10}
+                  <Eye className="w-3.5 h-3.5" /> {b.views ?? 0}
                 </span>
               </div>
             </div>
           </div>
         ))}
       </div>
+
+      {blogs.length === 0 && (
+        <div className="bg-white border border-slate-200 rounded-3xl p-12 text-center space-y-2">
+          <FileText className="w-10 h-10 mx-auto text-slate-300" />
+          <p className="text-sm font-bold text-slate-700">{loadError ? 'Artikel belum dapat dimuat' : 'Belum ada artikel yang diterbitkan'}</p>
+          <p className="text-xs text-slate-500">
+            {loadError || (canWriteBlog ? 'Klik "Tulis Karya Baru" untuk menerbitkan artikel pertama.' : 'Nantikan karya tulis guru dan siswa di sini.')}
+          </p>
+        </div>
+      )}
 
       {/* Modal Baca Artikel Lengkap */}
       {selectedBlog && (
@@ -193,7 +225,7 @@ export default function BlogView() {
             </div>
 
             <img
-              src={selectedBlog.cover_image}
+              src={selectedBlog.cover_image || DEFAULT_COVER}
               alt={selectedBlog.title}
               className="w-full h-56 object-cover rounded-2xl"
             />
@@ -292,7 +324,7 @@ export default function BlogView() {
                       />
                       <UploadCloud className="w-6 h-6 text-[#002147] mb-1" />
                       <p className="text-xs font-bold text-slate-800">Pilih foto cover dari komputer</p>
-                      <p className="text-[10px] text-slate-500">JPG, PNG, WEBP hingga 25 MB</p>
+                      <p className="text-[10px] text-slate-500">JPG, PNG, WEBP hingga 5 MB</p>
                     </label>
                   ) : (
                     <div className="relative rounded-xl overflow-hidden border border-slate-200 h-32">

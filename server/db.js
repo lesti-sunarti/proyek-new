@@ -7,7 +7,51 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const dbPath = path.resolve(__dirname, '../school.db');
 
-export const db = new DatabaseSync(dbPath);
+const rawDb = new DatabaseSync(dbPath);
+
+// node:sqlite menolak nilai `undefined` dan boolean saat binding parameter.
+// Lapisan tipis ini menormalkan nilai tersebut (undefined → NULL, boolean → 0/1,
+// NaN/Infinity → NULL, Date → ISO string) agar field opsional yang kosong dari
+// klien tidak membuat endpoint gagal dengan HTTP 500.
+function normalizeParam(value) {
+  if (value === undefined) return null;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
+  if (value instanceof Date) return value.toISOString();
+  return value;
+}
+
+function wrapStatement(statement) {
+  return {
+    run: (...params) => statement.run(...params.map(normalizeParam)),
+    get: (...params) => statement.get(...params.map(normalizeParam)),
+    all: (...params) => statement.all(...params.map(normalizeParam)),
+  };
+}
+
+export const db = {
+  prepare: (sql) => wrapStatement(rawDb.prepare(sql)),
+  exec: (sql) => rawDb.exec(sql),
+};
+
+let transactionDepth = 0;
+// Menjalankan beberapa perintah tulis secara atomik. Transaksi bersarang ikut
+// bergabung ke transaksi terluar sehingga aman dipanggil dari helper lain.
+export function transaction(work) {
+  if (transactionDepth > 0) return work();
+  rawDb.exec('BEGIN IMMEDIATE');
+  transactionDepth += 1;
+  try {
+    const result = work();
+    rawDb.exec('COMMIT');
+    return result;
+  } catch (error) {
+    try { rawDb.exec('ROLLBACK'); } catch { /* transaksi sudah ditutup */ }
+    throw error;
+  } finally {
+    transactionDepth -= 1;
+  }
+}
 
 export function hashPassword(password) {
   const salt = randomBytes(16).toString('hex');
@@ -31,9 +75,47 @@ export function hashSessionToken(token) {
 
 // Aktifkan foreign keys & WAL mode
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA busy_timeout = 5000;');
 
 function hasColumn(tableName, columnName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().some((column) => column.name === columnName);
+}
+
+// Instalasi lama membatasi holder_role dompet pada 4 peran legacy sehingga akun
+// staf (kepala_tu, kepala_sekolah, dst.) tidak bisa mempunyai dompet. Tabel
+// dibangun ulang tanpa CHECK tersebut sambil mempertahankan seluruh data.
+function relaxWalletRoleConstraint() {
+  const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wallets'").get();
+  if (!table || !/CHECK\s*\(\s*holder_role/i.test(table.sql)) return;
+  db.exec('PRAGMA foreign_keys = OFF;');
+  try {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE wallets_migrated (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        card_number TEXT UNIQUE NOT NULL,
+        holder_name TEXT NOT NULL,
+        holder_role TEXT NOT NULL,
+        holder_identifier TEXT,
+        balance INTEGER DEFAULT 0,
+        pin TEXT DEFAULT '123456',
+        status TEXT DEFAULT 'aktif' CHECK(status IN ('aktif', 'dibekukan', 'nonaktif')),
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO wallets_migrated (id, user_id, card_number, holder_name, holder_role, holder_identifier, balance, pin, status, created_at)
+        SELECT id, user_id, card_number, holder_name, holder_role, holder_identifier, balance, pin, status, created_at FROM wallets;
+      DROP TABLE wallets;
+      ALTER TABLE wallets_migrated RENAME TO wallets;
+      COMMIT;
+    `);
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch { /* tidak ada transaksi aktif */ }
+    throw error;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON;');
+  }
 }
 
 function migrateLegacyPasswordTable(tableName) {
@@ -554,6 +636,18 @@ export function initDatabase() {
       achievements TEXT
     );
 
+    -- 4b. Keanggotaan Ekstrakurikuler (mencegah pendaftaran ganda)
+    CREATE TABLE IF NOT EXISTS extracurricular_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      extracurricular_id INTEGER NOT NULL,
+      student_name TEXT NOT NULL,
+      class_name TEXT,
+      reason TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (extracurricular_id) REFERENCES extracurriculars(id) ON DELETE CASCADE,
+      UNIQUE(extracurricular_id, student_name)
+    );
+
     -- 5. Tabel Konseling BK Online
     CREATE TABLE IF NOT EXISTS counseling_sessions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -675,7 +769,7 @@ export function initDatabase() {
       user_id INTEGER,
       card_number TEXT UNIQUE NOT NULL,
       holder_name TEXT NOT NULL,
-      holder_role TEXT NOT NULL CHECK(holder_role IN ('siswa', 'guru', 'admin', 'ortu')),
+      holder_role TEXT NOT NULL,
       holder_identifier TEXT,
       balance INTEGER DEFAULT 0,
       pin TEXT DEFAULT '123456',
@@ -773,6 +867,7 @@ export function initDatabase() {
   // Setelah proses ini selesai, kolom password lama dihapus dari database.
   migrateLegacyPasswordTable('users');
   migrateLegacyPasswordTable('staff_accounts');
+  relaxWalletRoleConstraint();
   db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ?').run(new Date().toISOString());
 
   // Akun lokal untuk demonstrasi. Ganti password ini sebelum dipakai di lingkungan produksi.

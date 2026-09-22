@@ -7,6 +7,7 @@ import {
   Search, Edit3, Trash2, X, RefreshCw, Eye, Award, CheckCircle2,
   Calendar, Phone, MapPin, User, AlertTriangle
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 
 const API = '/api/walikelas';
 async function apiFetch(path, opts = {}) {
@@ -19,17 +20,21 @@ async function apiFetch(path, opts = {}) {
       ...opts,
     });
     clearTimeout(timeoutId);
-    if (!res.ok) {
-      let msg = 'Terjadi kesalahan pada server';
-      try {
-        const errJson = await res.json();
-        msg = errJson.message || msg;
-      } catch {
-        msg = await res.text();
-      }
-      throw new Error(msg);
+    // Baca body sekali saja (res.json() lalu res.text() gagal karena stream sudah terpakai).
+    const raw = await res.text();
+    let data = null;
+    if (raw) {
+      try { data = JSON.parse(raw); } catch { data = null; }
     }
-    return await res.json();
+    if (!res.ok || (data && data.success === false)) {
+      const fallback = res.status === 401
+        ? 'Silakan masuk terlebih dahulu untuk mengakses modul Wali Kelas.'
+        : res.status === 403
+          ? 'Akun Anda tidak memiliki hak akses modul Wali Kelas.'
+          : `Terjadi kesalahan pada server (HTTP ${res.status})`;
+      throw new Error((data && data.message) || fallback);
+    }
+    return data;
   } catch (err) {
     clearTimeout(timeoutId);
     if (err.name === 'AbortError') {
@@ -38,6 +43,30 @@ async function apiFetch(path, opts = {}) {
     throw err;
   }
 }
+
+const pad2 = (n) => String(n).padStart(2, '0');
+// Tanggal hari ini dalam zona waktu lokal (bukan UTC) agar tidak bergeser sehari pada dini hari WIB.
+const todayLocal = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+};
+const DAY_NAMES_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+const todayDayName = () => DAY_NAMES_ID[new Date().getDay()];
+// null/undefined/'' berarti siswa belum dinilai (server mengirim null bila grade_id null).
+const hasScore = (v) => v !== null && v !== undefined && v !== '' && !Number.isNaN(Number(v));
+const formatScore = (v) => (hasScore(v) ? Number(v) : '-');
+const isDocumentLink = (url) => typeof url === 'string' && url.trim() !== '' && url.trim() !== '#' && /^(https?:\/\/|\/)/i.test(url.trim());
+const CASE_STATUSES = ['Dalam Pemantauan', 'Dalam Pembinaan', 'Selesai'];
+const makeJournalForm = () => ({
+  date: todayLocal(),
+  period_range: 'Jam ke 1-2 (07.15 - 08.45)',
+  subject_name: '',
+  teacher_name: '',
+  topic_material: '',
+  attendance_summary: '',
+  incident_notes: '',
+  status: 'Terlaksana'
+});
 
 const DEFAULT_DASHBOARD_DATA = {
   success: true,
@@ -183,8 +212,9 @@ function DashboardTab() {
   const info = currentData.info || DEFAULT_DASHBOARD_DATA.info;
   const stats = currentData.stats || DEFAULT_DASHBOARD_DATA.stats;
   const att = stats.attendanceToday || DEFAULT_DASHBOARD_DATA.stats.attendanceToday;
+  const inv = stats.inventory || DEFAULT_DASHBOARD_DATA.stats.inventory;
   const piketToday = currentData.piketToday;
-  const scheduleToday = currentData.scheduleToday || [];
+  const scheduleToday = Array.isArray(currentData.scheduleToday) ? currentData.scheduleToday : [];
 
   return (
     <div className="space-y-6">
@@ -247,7 +277,7 @@ function DashboardTab() {
         <StatCard icon={Users} label="Total Siswa" value={stats.totalStudents} sub={`L: ${stats.maleStudents} | P: ${stats.femaleStudents}`} color="navy" />
         <StatCard icon={UserCheck} label="Kehadiran Hari Ini" value={att.present} sub={`${att.percentage}% Siswa Hadir`} color="emerald" />
         <StatCard icon={ShieldAlert} label="Kasus Aktif" value={stats.activeCasesCount} sub="Perlu pembinaan BK" color="red" />
-        <StatCard icon={Package} label="Inventaris" value={`${stats.inventory.total} unit`} sub={`${stats.inventory.good} baik / ${stats.inventory.damaged} rusak`} color="amber" />
+        <StatCard icon={Package} label="Inventaris" value={`${inv.total} unit`} sub={`${inv.good} baik / ${inv.damaged} rusak`} color="amber" />
       </div>
 
       {/* Attendance Detail Strip */}
@@ -319,7 +349,7 @@ function DashboardTab() {
           <div className="flex items-center justify-between mb-3.5 pb-2 border-b border-gray-100">
             <h3 className="font-bold text-gray-800 text-sm flex items-center gap-2">
               <BookOpen size={16} className="text-blue-600" />
-              Jadwal KBM Hari Ini ({piketToday?.day || 'Senin'})
+              Jadwal KBM Hari Ini ({todayDayName()})
             </h3>
             <Badge color="blue">{scheduleToday?.length || 0} Mapel</Badge>
           </div>
@@ -356,6 +386,7 @@ function DashboardTab() {
 // 2. DATA SISWA TAB (Search, Add, Edit, Delete)
 // ============================================================================
 function DataSiswaTab() {
+  const { showToast } = useAuth();
   const [students, setStudents] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
@@ -370,7 +401,7 @@ function DataSiswaTab() {
     setLoading(true);
     apiFetch('/students')
       .then(setStudents)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -404,26 +435,42 @@ function DataSiswaTab() {
   const handleSave = async (e) => {
     e.preventDefault();
     if (!form.name.trim() || !form.nis.trim()) {
-      alert('Nama siswa dan NIS wajib diisi!');
+      showToast('Nama siswa dan NIS wajib diisi!', 'error');
       return;
     }
     setSaving(true);
     try {
+      const optional = (value) => (String(value || '').trim() ? String(value).trim() : null);
+      const payload = {
+        nis: form.nis.trim(),
+        nisn: optional(form.nisn),
+        name: form.name.trim(),
+        gender: form.gender || 'L',
+        phone_student: optional(form.phone_student),
+        phone_parent: optional(form.phone_parent),
+        address: optional(form.address),
+        blood_type: form.blood_type || 'O',
+        birth_date: optional(form.birth_date),
+        notes: optional(form.notes),
+      };
       if (editStudent) {
-        await apiFetch(`/students/${editStudent.id}`, {
+        // Server menimpa semua kolom saat PUT; sertakan status & avatar lama agar tidak terhapus.
+        const res = await apiFetch(`/students/${editStudent.id}`, {
           method: 'PUT',
-          body: JSON.stringify(form)
+          body: JSON.stringify({ ...payload, status: editStudent.status || 'aktif', avatar: editStudent.avatar || null })
         });
+        showToast(res?.message || 'Biodata siswa berhasil diperbarui', 'success');
       } else {
-        await apiFetch('/students', {
+        const res = await apiFetch('/students', {
           method: 'POST',
-          body: JSON.stringify(form)
+          body: JSON.stringify(payload)
         });
+        showToast(res?.message || 'Siswa berhasil ditambahkan', 'success');
       }
       setShowModal(false);
       loadStudents();
     } catch (err) {
-      alert('Gagal menyimpan siswa: ' + err.message);
+      showToast(err.message || 'Gagal menyimpan siswa', 'error');
     } finally {
       setSaving(false);
     }
@@ -432,10 +479,11 @@ function DataSiswaTab() {
   const handleDelete = async (id, name) => {
     if (!window.confirm(`Hapus data siswa "${name}" dari rombel?`)) return;
     try {
-      await apiFetch(`/students/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/students/${id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Siswa berhasil dihapus dari rombel', 'success');
       loadStudents();
     } catch (err) {
-      alert('Gagal menghapus siswa: ' + err.message);
+      showToast(err.message || 'Gagal menghapus siswa', 'error');
     }
   };
 
@@ -443,8 +491,8 @@ function DataSiswaTab() {
     const q = search.toLowerCase();
     return students.filter(s =>
       (s.name || '').toLowerCase().includes(q) ||
-      (s.nis || '').includes(q) ||
-      (s.nisn || '').includes(q) ||
+      String(s.nis || '').toLowerCase().includes(q) ||
+      String(s.nisn || '').toLowerCase().includes(q) ||
       (s.address || '').toLowerCase().includes(q)
     );
   }, [students, search]);
@@ -541,7 +589,9 @@ function DataSiswaTab() {
               {filtered.length === 0 && (
                 <tr>
                   <td colSpan={8} className="text-center py-8 text-gray-400">
-                    Tidak ada siswa ditemukan dengan kata kunci "{search}"
+                    {students.length === 0
+                      ? 'Belum ada siswa terdaftar di rombel ini. Klik "Tambah Siswa" untuk memulai.'
+                      : `Tidak ada siswa ditemukan dengan kata kunci "${search}"`}
                   </td>
                 </tr>
               )}
@@ -709,6 +759,7 @@ function DataSiswaTab() {
 // 3. PENGURUS KELAS TAB
 // ============================================================================
 function PengurusTab() {
+  const { showToast } = useAuth();
   const [officers, setOfficers] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -716,7 +767,7 @@ function PengurusTab() {
     setLoading(true);
     apiFetch('/officers')
       .then(setOfficers)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -748,6 +799,11 @@ function PengurusTab() {
           </div>
         ))}
       </div>
+      {officers.length === 0 && (
+        <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+          Belum ada data pengurus kelas.
+        </div>
+      )}
     </div>
   );
 }
@@ -756,6 +812,7 @@ function PengurusTab() {
 // 4. JADWAL PIKET TAB (BUG FIX: uses day_name and members array!)
 // ============================================================================
 function PiketTab() {
+  const { showToast } = useAuth();
   const [piketList, setPiketList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [editPiket, setEditPiket] = useState(null);
@@ -767,7 +824,7 @@ function PiketTab() {
     setLoading(true);
     apiFetch('/piket')
       .then(setPiketList)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -785,14 +842,15 @@ function PiketTab() {
     try {
       const members = membersInput.split('\n').map(s => s.trim()).filter(Boolean);
       const duties = dutiesInput.split('\n').map(s => s.trim()).filter(Boolean);
-      await apiFetch(`/piket/${editPiket.id}`, {
+      const res = await apiFetch(`/piket/${editPiket.id}`, {
         method: 'PUT',
         body: JSON.stringify({ members, duties })
       });
+      showToast(res?.message || 'Jadwal piket berhasil diperbarui', 'success');
       setEditPiket(null);
       loadPiket();
     } catch (err) {
-      alert('Gagal menyimpan piket: ' + err.message);
+      showToast(err.message || 'Gagal menyimpan piket', 'error');
     } finally {
       setSaving(false);
     }
@@ -930,6 +988,7 @@ function PiketTab() {
 // 5. DENAH DUDUK TAB (Interactive Click-to-Swap & Assign)
 // ============================================================================
 function DenahTab() {
+  const { showToast } = useAuth();
   const [seats, setSeats] = useState([]);
   const [selectedSeat, setSelectedSeat] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -940,7 +999,7 @@ function DenahTab() {
     setLoading(true);
     apiFetch('/seating')
       .then(setSeats)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -949,7 +1008,7 @@ function DenahTab() {
   const handleSeatClick = async (seat) => {
     if (!selectedSeat) {
       setSelectedSeat(seat);
-      setMessage(`Kursi Meja ${seat.desk_number} (${seat.student_name || 'Kosong'}) dipilih. Klik kursi lain untuk menukar posisi.`);
+      setMessage(`Kursi ${seat.desk_number} (${seat.student_name || 'Kosong'}) dipilih. Klik kursi lain untuk menukar posisi.`);
     } else if (selectedSeat.id === seat.id) {
       setSelectedSeat(null);
       setMessage('');
@@ -961,11 +1020,11 @@ function DenahTab() {
           method: 'POST',
           body: JSON.stringify({ seat1_id: selectedSeat.id, seat2_id: seat.id })
         });
-        setMessage(`✅ Posisi duduk berhasil ditukar antara ${selectedSeat.student_name || 'Meja ' + selectedSeat.desk_number} dan ${seat.student_name || 'Meja ' + seat.desk_number}!`);
+        setMessage(`✅ Posisi duduk berhasil ditukar antara ${selectedSeat.student_name || 'Kursi ' + selectedSeat.desk_number} dan ${seat.student_name || 'Kursi ' + seat.desk_number}!`);
         setSelectedSeat(null);
         loadSeats();
       } catch (err) {
-        alert('Gagal menukar posisi duduk: ' + err.message);
+        showToast(err.message || 'Gagal menukar posisi duduk', 'error');
       } finally {
         setSaving(false);
       }
@@ -974,12 +1033,25 @@ function DenahTab() {
 
   if (loading) return <Spinner />;
 
-  // Group by desk_number (1 to 16)
-  const desks = [];
-  for (let d = 1; d <= 16; d++) {
-    const pair = seats.filter(s => s.desk_number === d).sort((a, b) => a.col_num - b.col_num);
-    desks.push({ deskNum: d, seats: pair });
-  }
+  // Di database, desk_number adalah NOMOR KURSI (1..32); satu meja = dua kursi dengan row_num & col_num sama.
+  // Kelompokkan berdasarkan posisi (baris, kolom) agar seluruh kursi tampil, bukan hanya 16 kursi pertama.
+  const seatList = Array.isArray(seats) ? seats : [];
+  const deskMap = new Map();
+  seatList.forEach(s => {
+    const seatNo = Number(s.desk_number) || 0;
+    const pairNo = Math.max(1, Math.ceil(seatNo / 2));
+    const row = Number(s.row_num) || Math.ceil(pairNo / 4);
+    const col = Number(s.col_num) || ((pairNo - 1) % 4) + 1;
+    const key = `${row}-${col}`;
+    if (!deskMap.has(key)) deskMap.set(key, { row, col, seats: [] });
+    deskMap.get(key).seats.push(s);
+  });
+  const desks = [...deskMap.values()]
+    .sort((a, b) => (a.row - b.row) || (a.col - b.col))
+    .map((desk, idx) => ({
+      deskNum: idx + 1,
+      seats: [...desk.seats].sort((a, b) => (Number(a.desk_number) || 0) - (Number(b.desk_number) || 0))
+    }));
 
   return (
     <div>
@@ -1030,7 +1102,7 @@ function DenahTab() {
                     key={s.id}
                     onClick={() => handleSeatClick(s)}
                     disabled={saving}
-                    className={`h-18 p-1 rounded-lg text-center flex flex-col items-center justify-center transition-all duration-150 border-2 ${
+                    className={`min-h-[4.5rem] p-1 rounded-lg text-center flex flex-col items-center justify-center transition-all duration-150 border-2 ${
                       isSelected
                         ? 'bg-amber-400 border-amber-600 text-amber-950 scale-105 shadow-md font-bold'
                         : s.student_name
@@ -1043,7 +1115,7 @@ function DenahTab() {
                       {s.student_name || 'Kosong'}
                     </span>
                     <span className="text-[9px] text-gray-400 mt-0.5">
-                      B{s.row_num}K{s.col_num}
+                      Kursi {s.desk_number} · B{s.row_num}K{s.col_num}
                     </span>
                   </button>
                 );
@@ -1052,6 +1124,11 @@ function DenahTab() {
           </div>
         ))}
       </div>
+      {desks.length === 0 && (
+        <div className="max-w-4xl mx-auto text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+          Belum ada data denah tempat duduk.
+        </div>
+      )}
     </div>
   );
 }
@@ -1060,6 +1137,7 @@ function DenahTab() {
 // 6. TATA TERTIB TAB
 // ============================================================================
 function TataTertibTab() {
+  const { showToast } = useAuth();
   const [rules, setRules] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -1069,7 +1147,7 @@ function TataTertibTab() {
     setLoading(true);
     apiFetch('/rules')
       .then(setRules)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -1077,17 +1155,26 @@ function TataTertibTab() {
 
   const handleAdd = async (e) => {
     e.preventDefault();
-    if (!form.title.trim()) return;
+    if (!form.title.trim()) {
+      showToast('Bunyi aturan wajib diisi', 'error');
+      return;
+    }
     try {
-      await apiFetch('/rules', {
+      const res = await apiFetch('/rules', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({
+          ...form,
+          title: form.title.trim(),
+          description: form.description.trim() || null,
+          points: Number(form.points) || 5
+        })
       });
+      showToast(res?.message || 'Tata tertib berhasil ditambahkan', 'success');
       setShowAdd(false);
       setForm({ category: 'Disiplin', title: '', description: '', points: 5 });
       loadRules();
     } catch (err) {
-      alert('Gagal menambah aturan: ' + err.message);
+      showToast(err.message || 'Gagal menambah aturan', 'error');
     }
   };
 
@@ -1097,7 +1184,7 @@ function TataTertibTab() {
       await apiFetch(`/rules/${id}`, { method: 'DELETE' });
       loadRules();
     } catch (err) {
-      alert('Gagal menghapus aturan: ' + err.message);
+      showToast(err.message || 'Gagal menghapus aturan', 'error');
     }
   };
 
@@ -1127,7 +1214,7 @@ function TataTertibTab() {
             </div>
             <div className="flex-1">
               <div className="flex items-center justify-between gap-2 mb-1">
-                <Badge color={r.category === 'Disiplin' ? 'blue' : r.category === 'Kerapian' ? 'purple' : 'amber'}>
+                <Badge color={r.category === 'Disiplin' ? 'blue' : r.category === 'Kerapian' ? 'purple' : 'yellow'}>
                   {r.category}
                 </Badge>
                 <div className="flex items-center gap-2">
@@ -1149,6 +1236,11 @@ function TataTertibTab() {
           </div>
         ))}
       </div>
+      {rules.length === 0 && (
+        <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+          Belum ada tata tertib yang dicatat.
+        </div>
+      )}
 
       {showAdd && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
@@ -1233,6 +1325,7 @@ function TataTertibTab() {
 // 7. JADWAL PELAJARAN TAB
 // ============================================================================
 function JadwalTab() {
+  const { showToast } = useAuth();
   const [schedule, setSchedule] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedDay, setSelectedDay] = useState('all');
@@ -1241,13 +1334,11 @@ function JadwalTab() {
     setLoading(true);
     apiFetch(`/schedule?day=${selectedDay}`)
       .then(setSchedule)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => { loadSchedule(); }, [selectedDay]);
-
-  if (loading) return <Spinner />;
 
   return (
     <div>
@@ -1272,6 +1363,7 @@ function JadwalTab() {
         }
       />
 
+      {loading ? <Spinner /> : (
       <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-xs">
         <table className="min-w-full text-xs">
           <thead className="bg-[#002147] text-white">
@@ -1297,9 +1389,17 @@ function JadwalTab() {
                 <td className="px-3 py-2 text-center font-semibold text-gray-500">{s.room}</td>
               </tr>
             ))}
+            {schedule.length === 0 && (
+              <tr>
+                <td colSpan={6} className="text-center py-8 text-gray-400">
+                  Belum ada jadwal pelajaran{selectedDay !== 'all' ? ` untuk hari ${selectedDay}` : ''}.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
+      )}
     </div>
   );
 }
@@ -1308,7 +1408,8 @@ function JadwalTab() {
 // 8. PRESENSI HARIAN TAB (BUG FIX: 'Hadir'|'Sakit'|'Izin'|'Alpa')
 // ============================================================================
 function PresensiTab() {
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const { showToast } = useAuth();
+  const [date, setDate] = useState(todayLocal());
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -1318,9 +1419,9 @@ function PresensiTab() {
     setLoading(true);
     apiFetch(`/attendance?date=${dt}`)
       .then(res => {
-        setRecords(res.records || []);
+        setRecords(Array.isArray(res?.records) ? res.records : []);
       })
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -1339,16 +1440,21 @@ function PresensiTab() {
   };
 
   const handleSave = async () => {
+    if (!date) { showToast('Pilih tanggal presensi terlebih dahulu', 'error'); return; }
+    if (records.length === 0) { showToast('Belum ada siswa yang dapat dipresensi pada tanggal ini', 'error'); return; }
     setSaving(true);
     try {
-      await apiFetch('/attendance', {
+      const res = await apiFetch('/attendance', {
         method: 'POST',
-        body: JSON.stringify({ date, records })
+        body: JSON.stringify({
+          date,
+          records: records.map(r => ({ student_id: r.student_id, status: r.status || 'Hadir', notes: (r.notes || '').trim() || null }))
+        })
       });
-      setSavedMsg(`✅ Presensi tanggal ${date} berhasil disimpan ke database!`);
+      setSavedMsg(res?.message ? `✅ ${res.message}` : `✅ Presensi tanggal ${date} berhasil disimpan ke database!`);
       setTimeout(() => setSavedMsg(''), 4000);
     } catch (err) {
-      alert('Gagal menyimpan presensi: ' + err.message);
+      showToast(err.message || 'Gagal menyimpan presensi', 'error');
     } finally {
       setSaving(false);
     }
@@ -1473,6 +1579,13 @@ function PresensiTab() {
                   </td>
                 </tr>
               ))}
+              {records.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="text-center py-8 text-gray-400">
+                    Belum ada siswa terdaftar di rombel ini.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -1485,25 +1598,17 @@ function PresensiTab() {
 // 9. JURNAL PEMBELAJARAN TAB
 // ============================================================================
 function JurnalTab() {
+  const { showToast } = useAuth();
   const [journals, setJournals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({
-    date: new Date().toISOString().split('T')[0],
-    period_range: 'Jam ke 1-2 (07.15 - 08.45)',
-    subject_name: '',
-    teacher_name: '',
-    topic_material: '',
-    attendance_summary: '32 Siswa Hadir',
-    incident_notes: '',
-    status: 'Terlaksana'
-  });
+  const [form, setForm] = useState(makeJournalForm);
 
   const loadJournal = () => {
     setLoading(true);
     apiFetch('/journal')
       .then(setJournals)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -1512,28 +1617,28 @@ function JurnalTab() {
   const handleSave = async (e) => {
     e.preventDefault();
     if (!form.subject_name.trim() || !form.topic_material.trim()) {
-      alert('Mata pelajaran dan materi wajib diisi!');
+      showToast('Mata pelajaran dan materi wajib diisi!', 'error');
       return;
     }
     try {
-      await apiFetch('/journal', {
+      const res = await apiFetch('/journal', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({
+          ...form,
+          date: form.date || todayLocal(),
+          subject_name: form.subject_name.trim(),
+          teacher_name: form.teacher_name.trim(),
+          topic_material: form.topic_material.trim(),
+          attendance_summary: form.attendance_summary.trim() || undefined,
+          incident_notes: form.incident_notes.trim() || null,
+        })
       });
+      showToast(res?.message || 'Jurnal KBM berhasil dicatat', 'success');
       setShowAdd(false);
-      setForm({
-        date: new Date().toISOString().split('T')[0],
-        period_range: 'Jam ke 1-2 (07.15 - 08.45)',
-        subject_name: '',
-        teacher_name: '',
-        topic_material: '',
-        attendance_summary: '32 Siswa Hadir',
-        incident_notes: '',
-        status: 'Terlaksana'
-      });
+      setForm(makeJournalForm());
       loadJournal();
     } catch (err) {
-      alert('Gagal menambah jurnal: ' + err.message);
+      showToast(err.message || 'Gagal menambah jurnal', 'error');
     }
   };
 
@@ -1543,7 +1648,7 @@ function JurnalTab() {
       await apiFetch(`/journal/${id}`, { method: 'DELETE' });
       loadJournal();
     } catch (err) {
-      alert('Gagal menghapus jurnal: ' + err.message);
+      showToast(err.message || 'Gagal menghapus jurnal', 'error');
     }
   };
 
@@ -1593,10 +1698,15 @@ function JurnalTab() {
                   📝 {j.incident_notes}
                 </p>
               )}
-              <p className="text-[11px] text-gray-400 mt-2">Kehadiran: {j.attendance_summary}</p>
+              <p className="text-[11px] text-gray-400 mt-2">Kehadiran: {j.attendance_summary || '-'}</p>
             </div>
           </div>
         ))}
+        {journals.length === 0 && (
+          <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+            Belum ada entri jurnal KBM.
+          </div>
+        )}
       </div>
 
       {showAdd && (
@@ -1676,6 +1786,30 @@ function JurnalTab() {
                   onChange={e => setForm({ ...form, incident_notes: e.target.value })}
                 />
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Ringkasan Kehadiran</label>
+                  <input
+                    type="text"
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2"
+                    placeholder="Contoh: 30 Hadir, 1 Sakit, 1 Izin"
+                    value={form.attendance_summary}
+                    onChange={e => setForm({ ...form, attendance_summary: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Status KBM</label>
+                  <select
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2"
+                    value={form.status}
+                    onChange={e => setForm({ ...form, status: e.target.value })}
+                  >
+                    <option value="Terlaksana">Terlaksana</option>
+                    <option value="Tugas Mandiri">Tugas Mandiri (guru berhalangan)</option>
+                    <option value="Tidak Terlaksana">Tidak Terlaksana</option>
+                  </select>
+                </div>
+              </div>
               <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
                 <button
                   type="button"
@@ -1703,11 +1837,12 @@ function JurnalTab() {
 // 10. REKAP NILAI AKADEMIK TAB (With Subject Picker & Edit Modal)
 // ============================================================================
 function NilaiTab() {
+  const { showToast } = useAuth();
   const [subject, setSubject] = useState('Matematika Peminatan');
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
   const [editingRow, setEditingRow] = useState(null);
-  const [form, setForm] = useState({ task_1: 80, task_2: 85, mid_exam: 80, final_exam: 85 });
+  const [form, setForm] = useState({ task_1: '', task_2: '', mid_exam: '', final_exam: '' });
   const [saving, setSaving] = useState(false);
 
   const subjects = [
@@ -1718,8 +1853,8 @@ function NilaiTab() {
   const loadGrades = (subj) => {
     setLoading(true);
     apiFetch(`/grades?subject=${encodeURIComponent(subj)}`)
-      .then(res => setRecords(res.records || []))
-      .catch(console.error)
+      .then(res => setRecords(Array.isArray(res?.records) ? res.records : []))
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -1727,37 +1862,57 @@ function NilaiTab() {
 
   const openEdit = (row) => {
     setEditingRow(row);
+    // Siswa yang belum dinilai (null) mendapat input kosong, bukan angka palsu.
     setForm({
-      task_1: row.task_1 || 80,
-      task_2: row.task_2 || 85,
-      mid_exam: row.mid_exam || 80,
-      final_exam: row.final_exam || 85
+      task_1: hasScore(row.task_1) ? row.task_1 : '',
+      task_2: hasScore(row.task_2) ? row.task_2 : '',
+      mid_exam: hasScore(row.mid_exam) ? row.mid_exam : '',
+      final_exam: hasScore(row.final_exam) ? row.final_exam : ''
     });
   };
 
   const handleSaveScore = async (e) => {
     e.preventDefault();
     if (!editingRow) return;
+    const fields = ['task_1', 'task_2', 'mid_exam', 'final_exam'];
+    const invalid = fields.some(key => !hasScore(form[key]) || Number(form[key]) < 0 || Number(form[key]) > 100);
+    if (invalid) {
+      showToast('Semua komponen nilai wajib diisi dengan angka 0 - 100', 'error');
+      return;
+    }
     setSaving(true);
     try {
-      await apiFetch('/grades', {
+      const res = await apiFetch('/grades', {
         method: 'POST',
         body: JSON.stringify({
           student_id: editingRow.student_id,
           subject_name: subject,
-          ...form
+          task_1: Number(form.task_1),
+          task_2: Number(form.task_2),
+          mid_exam: Number(form.mid_exam),
+          final_exam: Number(form.final_exam)
         })
       });
+      showToast(res?.message || 'Nilai siswa berhasil disimpan', 'success');
       setEditingRow(null);
       loadGrades(subject);
     } catch (err) {
-      alert('Gagal menyimpan nilai: ' + err.message);
+      showToast(err.message || 'Gagal menyimpan nilai', 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  if (loading) return <Spinner />;
+  // Rata-rata kelas hanya dihitung dari siswa yang sudah dinilai (grade_id tidak null).
+  const graded = records.filter(r => r.grade_id !== null && r.grade_id !== undefined && hasScore(r.final_grade));
+  const classAverage = graded.length > 0
+    ? graded.reduce((sum, r) => sum + Number(r.final_grade), 0) / graded.length
+    : null;
+  const predicateCounts = graded.reduce((acc, r) => {
+    const key = r.predicate || '-';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
 
   return (
     <div>
@@ -1779,6 +1934,30 @@ function NilaiTab() {
         }
       />
 
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+        <div className="rounded-xl bg-white border border-gray-200 p-3.5 shadow-xs">
+          <p className="text-[11px] text-gray-500 font-medium">Rata-rata Kelas</p>
+          <p className="text-2xl font-extrabold text-[#002147]">{classAverage === null ? '-' : classAverage.toFixed(1)}</p>
+          <span className="text-[10px] text-gray-400">Hanya dari siswa yang sudah dinilai</span>
+        </div>
+        <div className="rounded-xl bg-white border border-gray-200 p-3.5 shadow-xs">
+          <p className="text-[11px] text-gray-500 font-medium">Sudah Dinilai</p>
+          <p className="text-2xl font-extrabold text-emerald-700">{graded.length}</p>
+          <span className="text-[10px] text-gray-400">dari {records.length} siswa</span>
+        </div>
+        <div className="rounded-xl bg-white border border-gray-200 p-3.5 shadow-xs">
+          <p className="text-[11px] text-gray-500 font-medium">Belum Dinilai</p>
+          <p className="text-2xl font-extrabold text-amber-700">{records.length - graded.length}</p>
+          <span className="text-[10px] text-gray-400">Klik ikon edit untuk mengisi nilai</span>
+        </div>
+        <div className="rounded-xl bg-white border border-gray-200 p-3.5 shadow-xs">
+          <p className="text-[11px] text-gray-500 font-medium">Predikat A / B / C / D</p>
+          <p className="text-2xl font-extrabold text-gray-800">{predicateCounts.A || 0} / {predicateCounts.B || 0} / {predicateCounts.C || 0} / {predicateCounts.D || 0}</p>
+          <span className="text-[10px] text-gray-400 truncate block">Mapel: {subject}</span>
+        </div>
+      </div>
+
+      {loading ? <Spinner /> : (
       <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-xs">
         <table className="min-w-full text-xs">
           <thead className="bg-[#002147] text-white">
@@ -1799,15 +1978,19 @@ function NilaiTab() {
               <tr key={r.student_id} className="hover:bg-gray-50">
                 <td className="px-3 py-2 text-center text-gray-500">{idx + 1}</td>
                 <td className="px-3 py-2 font-bold text-gray-900">{r.name}</td>
-                <td className="px-3 py-2 text-center">{r.task_1}</td>
-                <td className="px-3 py-2 text-center">{r.task_2}</td>
-                <td className="px-3 py-2 text-center">{r.mid_exam}</td>
-                <td className="px-3 py-2 text-center">{r.final_exam}</td>
-                <td className="px-3 py-2 text-center font-extrabold text-[#002147]">{r.final_grade}</td>
+                <td className="px-3 py-2 text-center">{formatScore(r.task_1)}</td>
+                <td className="px-3 py-2 text-center">{formatScore(r.task_2)}</td>
+                <td className="px-3 py-2 text-center">{formatScore(r.mid_exam)}</td>
+                <td className="px-3 py-2 text-center">{formatScore(r.final_exam)}</td>
+                <td className="px-3 py-2 text-center font-extrabold text-[#002147]">{formatScore(r.final_grade)}</td>
                 <td className="px-3 py-2 text-center">
-                  <Badge color={r.predicate === 'A' ? 'green' : r.predicate === 'B' ? 'blue' : 'yellow'}>
-                    {r.predicate}
-                  </Badge>
+                  {r.grade_id !== null && r.grade_id !== undefined && r.predicate ? (
+                    <Badge color={r.predicate === 'A' ? 'green' : r.predicate === 'B' ? 'blue' : r.predicate === 'C' ? 'yellow' : 'red'}>
+                      {r.predicate}
+                    </Badge>
+                  ) : (
+                    <Badge color="gray">Belum dinilai</Badge>
+                  )}
                 </td>
                 <td className="px-3 py-2 text-center">
                   <button
@@ -1820,9 +2003,17 @@ function NilaiTab() {
                 </td>
               </tr>
             ))}
+            {records.length === 0 && (
+              <tr>
+                <td colSpan={9} className="text-center py-8 text-gray-400">
+                  Belum ada siswa terdaftar di rombel ini.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
+      )}
 
       {editingRow && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
@@ -1904,6 +2095,7 @@ function NilaiTab() {
 // 11. BUKU KASUS & PEMBINAAN TAB
 // ============================================================================
 function KasusTab() {
+  const { showToast } = useAuth();
   const [cases, setCases] = useState([]);
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -1911,6 +2103,7 @@ function KasusTab() {
   const [form, setForm] = useState({
     student_id: '',
     student_name: '',
+    date: todayLocal(),
     incident_type: 'Keterlambatan Berulang',
     description: '',
     action_taken: '',
@@ -1922,13 +2115,14 @@ function KasusTab() {
     setLoading(true);
     Promise.all([apiFetch('/cases'), apiFetch('/students')])
       .then(([cList, sList]) => {
-        setCases(cList || []);
-        setStudents(sList || []);
-        if (sList.length > 0 && !form.student_id) {
-          setForm(f => ({ ...f, student_id: sList[0].id, student_name: sList[0].name }));
+        const studentList = Array.isArray(sList) ? sList : [];
+        setCases(Array.isArray(cList) ? cList : []);
+        setStudents(studentList);
+        if (studentList.length > 0 && !form.student_id) {
+          setForm(f => ({ ...f, student_id: studentList[0].id, student_name: studentList[0].name }));
         }
       })
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -1941,19 +2135,27 @@ function KasusTab() {
 
   const handleSave = async (e) => {
     e.preventDefault();
-    if (!form.student_name || !form.description.trim()) {
-      alert('Siswa dan kronologi wajib diisi!');
+    if (!form.student_id || !form.student_name || !form.description.trim()) {
+      showToast('Siswa dan kronologi wajib diisi!', 'error');
       return;
     }
     try {
-      await apiFetch('/cases', {
+      const res = await apiFetch('/cases', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({
+          ...form,
+          student_id: Number(form.student_id),
+          date: form.date || todayLocal(),
+          description: form.description.trim(),
+          action_taken: form.action_taken.trim(),
+        })
       });
+      showToast(res?.message || 'Kasus pembinaan berhasil dicatat', 'success');
       setShowAdd(false);
       setForm({
         student_id: students[0]?.id || '',
         student_name: students[0]?.name || '',
+        date: todayLocal(),
         incident_type: 'Keterlambatan Berulang',
         description: '',
         action_taken: '',
@@ -1962,17 +2164,33 @@ function KasusTab() {
       });
       loadCases();
     } catch (err) {
-      alert('Gagal mencatat kasus: ' + err.message);
+      showToast(err.message || 'Gagal mencatat kasus', 'error');
     }
   };
 
   const handleDelete = async (id) => {
     if (!window.confirm('Hapus catatan kasus ini?')) return;
     try {
-      await apiFetch(`/cases/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/cases/${id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Catatan kasus berhasil dihapus', 'success');
       loadCases();
     } catch (err) {
-      alert('Gagal menghapus kasus: ' + err.message);
+      showToast(err.message || 'Gagal menghapus kasus', 'error');
+    }
+  };
+
+  // Server PUT /cases/:id menimpa status, action_taken, dan parent_notified sekaligus, jadi kirim ketiganya.
+  const handleStatusChange = async (c, status) => {
+    if (!status || status === c.status) return;
+    try {
+      const res = await apiFetch(`/cases/${c.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ status, action_taken: c.action_taken || '', parent_notified: !!c.parent_notified })
+      });
+      showToast(res?.message || 'Status pembinaan kasus berhasil diperbarui', 'success');
+      loadCases();
+    } catch (err) {
+      showToast(err.message || 'Gagal memperbarui status kasus', 'error');
     }
   };
 
@@ -2005,6 +2223,15 @@ function KasusTab() {
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[11px] text-gray-400">{c.date}</span>
+                <select
+                  value={c.status || 'Dalam Pemantauan'}
+                  onChange={e => handleStatusChange(c, e.target.value)}
+                  className="border border-gray-300 rounded-lg px-2 py-1 text-[11px] font-semibold text-gray-700 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  title="Ubah status pembinaan"
+                >
+                  {c.status && !CASE_STATUSES.includes(c.status) && <option value={c.status}>{c.status}</option>}
+                  {CASE_STATUSES.map(st => <option key={st} value={st}>{st}</option>)}
+                </select>
                 <button
                   onClick={() => handleDelete(c.id)}
                   className="text-gray-400 hover:text-red-600 p-1"
@@ -2051,10 +2278,21 @@ function KasusTab() {
                   value={form.student_id}
                   onChange={e => handleStudentSelect(e.target.value)}
                 >
+                  {students.length === 0 && <option value="">Belum ada siswa di rombel</option>}
                   {students.map(s => (
                     <option key={s.id} value={s.id}>{s.name} ({s.nis})</option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Tanggal Kejadian</label>
+                <input
+                  type="date"
+                  required
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2"
+                  value={form.date}
+                  onChange={e => setForm({ ...form, date: e.target.value })}
+                />
               </div>
               <div>
                 <label className="font-semibold text-gray-700 block mb-1">Jenis Kasus / Pelanggaran</label>
@@ -2114,7 +2352,8 @@ function KasusTab() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 bg-red-700 hover:bg-red-800 text-white rounded-lg font-bold"
+                  disabled={students.length === 0}
+                  className="px-4 py-1.5 bg-red-700 hover:bg-red-800 text-white rounded-lg font-bold disabled:opacity-50"
                 >
                   Simpan Catatan
                 </button>
@@ -2131,6 +2370,7 @@ function KasusTab() {
 // 12. CATATAN P5 TAB
 // ============================================================================
 function P5Tab() {
+  const { showToast } = useAuth();
   const [p5List, setP5List] = useState([]);
   const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -2148,13 +2388,14 @@ function P5Tab() {
     setLoading(true);
     Promise.all([apiFetch('/p5'), apiFetch('/students')])
       .then(([pList, sList]) => {
-        setP5List(pList || []);
-        setStudents(sList || []);
-        if (sList.length > 0 && !form.student_id) {
-          setForm(f => ({ ...f, student_id: sList[0].id, student_name: sList[0].name }));
+        const studentList = Array.isArray(sList) ? sList : [];
+        setP5List(Array.isArray(pList) ? pList : []);
+        setStudents(studentList);
+        if (studentList.length > 0 && !form.student_id) {
+          setForm(f => ({ ...f, student_id: studentList[0].id, student_name: studentList[0].name }));
         }
       })
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -2167,16 +2408,21 @@ function P5Tab() {
 
   const handleSave = async (e) => {
     e.preventDefault();
+    if (!form.student_id || !form.student_name) {
+      showToast('Pilih siswa yang akan dinilai terlebih dahulu', 'error');
+      return;
+    }
     try {
-      await apiFetch('/p5', {
+      const res = await apiFetch('/p5', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({ ...form, student_id: Number(form.student_id), description: form.description.trim() || null })
       });
+      showToast(res?.message || 'Penilaian P5 berhasil disimpan', 'success');
       setShowAdd(false);
       setForm(f => ({ ...f, description: '' }));
       loadP5();
     } catch (err) {
-      alert('Gagal menambah P5: ' + err.message);
+      showToast(err.message || 'Gagal menambah P5', 'error');
     }
   };
 
@@ -2186,7 +2432,7 @@ function P5Tab() {
       await apiFetch(`/p5/${id}`, { method: 'DELETE' });
       loadP5();
     } catch (err) {
-      alert('Gagal menghapus P5: ' + err.message);
+      showToast(err.message || 'Gagal menghapus P5', 'error');
     }
   };
 
@@ -2232,6 +2478,11 @@ function P5Tab() {
           </div>
         ))}
       </div>
+      {p5List.length === 0 && (
+        <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+          Belum ada penilaian P5 yang dicatat.
+        </div>
+      )}
 
       {showAdd && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
@@ -2250,6 +2501,7 @@ function P5Tab() {
                   value={form.student_id}
                   onChange={e => handleStudentSelect(e.target.value)}
                 >
+                  {students.length === 0 && <option value="">Belum ada siswa di rombel</option>}
                   {students.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                 </select>
               </div>
@@ -2315,7 +2567,8 @@ function P5Tab() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded font-bold"
+                  disabled={students.length === 0}
+                  className="px-4 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded font-bold disabled:opacity-50"
                 >
                   Simpan P5
                 </button>
@@ -2332,6 +2585,7 @@ function P5Tab() {
 // 13. INVENTARIS KELAS TAB
 // ============================================================================
 function InventarisTab() {
+  const { showToast } = useAuth();
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -2341,7 +2595,7 @@ function InventarisTab() {
     setLoading(true);
     apiFetch('/inventory')
       .then(setItems)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -2349,17 +2603,27 @@ function InventarisTab() {
 
   const handleSave = async (e) => {
     e.preventDefault();
-    if (!form.item_name.trim()) return;
+    if (!form.item_name.trim()) {
+      showToast('Nama barang wajib diisi', 'error');
+      return;
+    }
     try {
-      await apiFetch('/inventory', {
+      const res = await apiFetch('/inventory', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({
+          ...form,
+          item_name: form.item_name.trim(),
+          quantity: Number(form.quantity) || 1,
+          unit: form.unit.trim() || 'Unit',
+          notes: form.notes.trim() || null
+        })
       });
+      showToast(res?.message || 'Barang inventaris berhasil ditambahkan', 'success');
       setShowAdd(false);
       setForm({ item_name: '', quantity: 1, unit: 'Unit', condition: 'Baik', notes: '' });
       loadInv();
     } catch (err) {
-      alert('Gagal menambah inventaris: ' + err.message);
+      showToast(err.message || 'Gagal menambah inventaris', 'error');
     }
   };
 
@@ -2369,7 +2633,7 @@ function InventarisTab() {
       await apiFetch(`/inventory/${id}`, { method: 'DELETE' });
       loadInv();
     } catch (err) {
-      alert('Gagal menghapus inventaris: ' + err.message);
+      showToast(err.message || 'Gagal menghapus inventaris', 'error');
     }
   };
 
@@ -2412,18 +2676,25 @@ function InventarisTab() {
                 <td className="px-3 py-2 font-bold text-gray-900">{item.item_name}</td>
                 <td className="px-3 py-2 text-center font-semibold">{item.quantity} {item.unit}</td>
                 <td className="px-3 py-2 text-center">
-                  <Badge color={item.condition === 'Baik' ? 'green' : item.condition === 'Cukup Baik' ? 'blue' : 'red'}>
+                  <Badge color={item.condition === 'Baik' ? 'green' : item.condition === 'Rusak Ringan' ? 'yellow' : 'red'}>
                     {item.condition}
                   </Badge>
                 </td>
                 <td className="px-3 py-2 text-gray-600">{item.notes || '-'}</td>
                 <td className="px-3 py-2 text-center">
-                  <button onClick={() => handleDelete(item.id)} className="text-gray-400 hover:text-red-600 p-1">
+                  <button onClick={() => handleDelete(item.id)} className="text-gray-400 hover:text-red-600 p-1" title="Hapus barang">
                     <Trash2 size={13} />
                   </button>
                 </td>
               </tr>
             ))}
+            {items.length === 0 && (
+              <tr>
+                <td colSpan={7} className="text-center py-8 text-gray-400">
+                  Belum ada barang inventaris yang dicatat.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -2479,7 +2750,6 @@ function InventarisTab() {
                   onChange={e => setForm({ ...form, condition: e.target.value })}
                 >
                   <option value="Baik">Baik</option>
-                  <option value="Cukup Baik">Cukup Baik</option>
                   <option value="Rusak Ringan">Rusak Ringan</option>
                   <option value="Rusak Berat">Rusak Berat</option>
                 </select>
@@ -2521,14 +2791,15 @@ function InventarisTab() {
 // 14. ARSIP DOKUMEN TAB
 // ============================================================================
 function ArsipTab() {
+  const { showToast } = useAuth();
   const [docs, setDocs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({
     doc_title: '',
     category: 'Administrasi',
-    doc_date: new Date().toISOString().split('T')[0],
-    file_url: '#',
+    doc_date: todayLocal(),
+    file_url: '',
     notes: ''
   });
 
@@ -2536,7 +2807,7 @@ function ArsipTab() {
     setLoading(true);
     apiFetch('/documents')
       .then(setDocs)
-      .catch(console.error)
+      .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
@@ -2544,23 +2815,49 @@ function ArsipTab() {
 
   const handleSave = async (e) => {
     e.preventDefault();
-    if (!form.doc_title.trim()) return;
+    if (!form.doc_title.trim()) {
+      showToast('Judul dokumen wajib diisi', 'error');
+      return;
+    }
+    const fileUrl = form.file_url.trim();
+    if (fileUrl && !isDocumentLink(fileUrl)) {
+      showToast('Tautan berkas harus diawali http://, https://, atau / (jalur di server ini)', 'error');
+      return;
+    }
     try {
-      await apiFetch('/documents', {
+      const res = await apiFetch('/documents', {
         method: 'POST',
-        body: JSON.stringify(form)
+        body: JSON.stringify({
+          ...form,
+          doc_title: form.doc_title.trim(),
+          doc_date: form.doc_date || todayLocal(),
+          file_url: fileUrl || '#',
+          notes: form.notes.trim() || null
+        })
       });
+      showToast(res?.message || 'Dokumen berhasil diarsipkan', 'success');
       setShowAdd(false);
       setForm({
         doc_title: '',
         category: 'Administrasi',
-        doc_date: new Date().toISOString().split('T')[0],
-        file_url: '#',
+        doc_date: todayLocal(),
+        file_url: '',
         notes: ''
       });
       loadDocs();
     } catch (err) {
-      alert('Gagal mengarsipkan: ' + err.message);
+      showToast(err.message || 'Gagal mengarsipkan', 'error');
+    }
+  };
+
+  const handleDelete = async (id) => {
+    if (!window.confirm('Hapus dokumen ini dari arsip?')) return;
+    try {
+      const res = await apiFetch(`/documents/${id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Dokumen berhasil dihapus', 'success');
+      loadDocs();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghapus dokumen', 'error');
     }
   };
 
@@ -2589,16 +2886,36 @@ function ArsipTab() {
               <FolderOpen size={22} />
             </div>
             <div className="flex-1 min-w-0">
-              <Badge color="blue">{d.category}</Badge>
+              <div className="flex items-center justify-between gap-2">
+                <Badge color="blue">{d.category}</Badge>
+                <button onClick={() => handleDelete(d.id)} className="text-gray-400 hover:text-red-600 p-1" title="Hapus dokumen">
+                  <Trash2 size={13} />
+                </button>
+              </div>
               <h4 className="font-bold text-gray-900 text-xs mt-1 leading-snug">{d.doc_title}</h4>
               {d.notes && <p className="text-xs text-gray-500 mt-1">{d.notes}</p>}
               <p className="text-[11px] text-gray-400 mt-2 flex items-center gap-1">
                 <Calendar size={11} /> {d.doc_date}
               </p>
+              {isDocumentLink(d.file_url) && (
+                <a
+                  href={d.file_url.trim()}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[11px] font-semibold text-blue-700 hover:underline mt-1 inline-flex items-center gap-1"
+                >
+                  <Eye size={11} /> Buka berkas
+                </a>
+              )}
             </div>
           </div>
         ))}
       </div>
+      {docs.length === 0 && (
+        <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
+          Belum ada dokumen yang diarsipkan.
+        </div>
+      )}
 
       {showAdd && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
@@ -2646,6 +2963,16 @@ function ArsipTab() {
                 </div>
               </div>
               <div>
+                <label className="font-semibold text-gray-700 block mb-1">Tautan Berkas (opsional)</label>
+                <input
+                  type="text"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2"
+                  placeholder="https://drive.google.com/... atau /uploads/berkas.pdf"
+                  value={form.file_url}
+                  onChange={e => setForm({ ...form, file_url: e.target.value })}
+                />
+              </div>
+              <div>
                 <label className="font-semibold text-gray-700 block mb-1">Catatan / Ringkasan</label>
                 <textarea
                   rows={2}
@@ -2682,6 +3009,7 @@ function ArsipTab() {
 // 15. PENGATURAN & CETAK TAB (Fully Interactive Form with Typing Support!)
 // ============================================================================
 function PengaturanTab() {
+  const { showToast } = useAuth();
   const [info, setInfo] = useState(DEFAULT_DASHBOARD_DATA.info);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -2715,14 +3043,16 @@ function PengaturanTab() {
     e.preventDefault();
     setSaving(true);
     try {
-      await apiFetch('/info', {
+      const res = await apiFetch('/info', {
         method: 'PUT',
         body: JSON.stringify(info)
       });
+      if (res?.info) setInfo(res.info);
+      showToast(res?.message || 'Profil dan pengaturan kelas berhasil diperbarui', 'success');
       setSavedMsg('✅ Profil dan Pengaturan Rombel Wali Kelas berhasil diperbarui!');
       setTimeout(() => setSavedMsg(''), 4000);
     } catch (err) {
-      alert('Gagal memperbarui pengaturan: ' + err.message);
+      showToast(err.message || 'Gagal memperbarui pengaturan', 'error');
     } finally {
       setSaving(false);
     }
@@ -2990,6 +3320,8 @@ const ADMIN_TABS = [
 // ============================================================================
 export default function WaliKelasView() {
   const [mainTab, setMainTab] = useState('dashboard');
+  // Kunci remount konten tab: "Segarkan Data" memuat ulang data tanpa reload halaman (reload melempar pengguna ke portal).
+  const [refreshKey, setRefreshKey] = useState(0);
   const [dataTab, setDataTab] = useState('siswa');
   const [harianTab, setHarianTab] = useState('presensi');
   const [evalTab, setEvalTab] = useState('nilai');
@@ -3065,7 +3397,7 @@ export default function WaliKelasView() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => window.location.reload()}
+            onClick={() => setRefreshKey(k => k + 1)}
             className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 text-emerald-800 rounded-xl text-xs font-bold shadow-xs transition-colors"
           >
             <RefreshCw size={14} /> Segarkan Data
@@ -3102,7 +3434,7 @@ export default function WaliKelasView() {
       </div>
 
       {/* Active Module Tab Content */}
-      <div className="bg-transparent">
+      <div className="bg-transparent" key={refreshKey}>
         {renderContent()}
       </div>
     </div>

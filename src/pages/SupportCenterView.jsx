@@ -49,7 +49,7 @@ export default function SupportCenterView() {
       setTickets([]);
       return;
     }
-    fetch('/api/support/tickets')
+    fetch('/api/support/tickets?limit=10')
       .then((response) => response.ok ? response.json() : [])
       .then((data) => setTickets(Array.isArray(data) ? data : []))
       .catch(() => setTickets([]));
@@ -70,11 +70,11 @@ export default function SupportCenterView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form),
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.message || 'Tiket belum dapat dikirim.');
-      setTickets((previous) => [result.ticket, ...previous]);
-      setForm((previous) => ({ ...initialForm, requester_name: currentUser?.name || '', requester_role: currentRole || 'siswa' }));
-      showToast(`Tiket ${result.ticket.ticket_number} berhasil dibuat.`, 'success');
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.success === false) throw new Error(result.message || 'Tiket belum dapat dikirim.');
+      if (result.ticket) setTickets((previous) => [result.ticket, ...previous]);
+      setForm(() => ({ ...initialForm, requester_name: currentUser?.name || '', requester_role: currentRole || 'siswa' }));
+      showToast(result.ticket?.ticket_number ? `Tiket ${result.ticket.ticket_number} berhasil dibuat.` : (result.message || 'Tiket berhasil dibuat.'), 'success');
     } catch (error) {
       showToast(error.message || 'Koneksi layanan bantuan sedang bermasalah.', 'error');
     } finally {

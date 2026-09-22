@@ -11,65 +11,129 @@ import {
   Compass, 
   GraduationCap, 
   CheckCircle2,
-  FileText
+  FileText,
+  MapPin
 } from 'lucide-react';
 
-export default function CounselingView() {
-  const { currentUser, currentRole, showToast } = useAuth();
-  const [sessions, setSessions] = useState([]);
-  const [showModal, setShowModal] = useState(false);
+const DEFAULT_COUNSELOR = 'Rina Marlina, S.Psi';
 
-  // Form Booking
+// Tanggal lokal (bukan UTC) agar konsisten dengan tanggal "hari ini" di server.
+const toLocalDateString = (date = new Date()) => {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
+
+export default function CounselingView() {
+  const { currentUser, currentRole, canAccess, showToast } = useAuth();
+  const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  // Daftar siswa dari Buku Induk hanya untuk peran yang berhak (kepala_bk/kepsek/admin); guru_walikelas mengisi manual.
+  const canListStudents = canAccess('buku_induk');
+  // Konselor: akun BK memakai namanya sendiri; peran lain mencatat atas nama guru BK.
+  const counselorName = currentRole === 'kepala_bk' ? currentUser.name : DEFAULT_COUNSELOR;
+  const [sessions, setSessions] = useState([]);
+  const [loadError, setLoadError] = useState('');
+  const [students, setStudents] = useState([]);
+  const [studentsLoaded, setStudentsLoaded] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Form Booking (identitas siswa tidak lagi ditulis tetap)
+  const [studentId, setStudentId] = useState(() => String(currentUser.related_student_id || (isStudentAccount ? '' : 1)));
+  const [studentName, setStudentName] = useState(currentRole === 'siswa' ? currentUser.name : '');
+  const [className, setClassName] = useState('');
   const [category, setCategory] = useState('karir');
   const [topic, setTopic] = useState('');
   const [sessionDate, setSessionDate] = useState(() => {
     const d = new Date();
     d.setDate(d.getDate() + 2);
-    return d.toISOString().split('T')[0];
+    return toLocalDateString(d);
   });
   const [sessionTime, setSessionTime] = useState('09:30');
   const [notes, setNotes] = useState('');
 
   const fetchSessions = () => {
-    fetch('/api/counseling/sessions')
-      .then(res => res.json())
-      .then(data => setSessions(data))
-      .catch(() => {});
+    fetchJson('/api/counseling/sessions')
+      .then(data => { setSessions(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setSessions([]); setLoadError(err.message || 'Data sesi konseling tidak dapat dimuat.'); });
   };
 
   useEffect(() => {
     fetchSessions();
   }, []);
 
-  const handleBookingSubmit = (e) => {
-    e.preventDefault();
-    fetch('/api/counseling/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        student_id: 1,
-        student_name: 'Aditya Pratama Putra',
-        class_name: 'X MIPA 1',
-        counselor_name: 'Rina Marlina, S.Psi',
-        session_date: sessionDate,
-        session_time: sessionTime,
-        category,
-        topic,
-        notes
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          showToast(data.message, 'success');
-          setShowModal(false);
-          setTopic('');
-          setNotes('');
-          fetchSessions();
-        }
-      })
-      .catch(() => showToast('Gagal mengajukan jadwal konseling', 'error'));
+  const loadStudents = () => {
+    if (!canListStudents || studentsLoaded) return;
+    fetchJson('/api/master/students')
+      .then(data => setStudents(Array.isArray(data) ? data.filter(s => String(s.status || 'aktif').toLowerCase() === 'aktif') : []))
+      .catch(() => setStudents([]))
+      .finally(() => setStudentsLoaded(true));
   };
+
+  const openModal = () => {
+    setShowModal(true);
+    loadStudents();
+  };
+
+  const handleStudentPick = (value) => {
+    setStudentId(value);
+    const student = students.find(s => String(s.id) === String(value));
+    if (student) {
+      setStudentName(student.name);
+      setClassName(student.class_name || '');
+    }
+  };
+
+  const handleBookingSubmit = async (e) => {
+    e.preventDefault();
+    if (isSubmitting) return;
+    const cleanTopic = topic.trim();
+    const cleanName = studentName.trim();
+    const cleanClass = className.trim();
+    const numericStudentId = Number(studentId);
+    if (!cleanTopic) return showToast('Topik konsultasi wajib diisi.', 'error');
+    if (!cleanName || !cleanClass) return showToast('Nama siswa dan kelas wajib diisi.', 'error');
+    if (!Number.isInteger(numericStudentId) || numericStudentId < 1) return showToast('Pilih siswa atau isi ID siswa (Buku Induk) yang valid.', 'error');
+    if (!sessionDate || sessionDate < toLocalDateString()) return showToast('Tanggal sesi tidak boleh sebelum hari ini.', 'error');
+
+    setIsSubmitting(true);
+    try {
+      const data = await fetchJson('/api/counseling/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          student_id: numericStudentId,
+          student_name: cleanName,
+          class_name: cleanClass,
+          counselor_name: counselorName,
+          session_date: sessionDate,
+          session_time: sessionTime,
+          category,
+          topic: cleanTopic,
+          notes: notes.trim()
+        })
+      });
+      showToast(data.message || 'Jadwal konseling berhasil diajukan.', 'success');
+      setShowModal(false);
+      setTopic('');
+      setNotes('');
+      fetchSessions();
+    } catch (err) {
+      showToast(err.message || 'Gagal mengajukan jadwal konseling', 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const scheduledCount = sessions.filter(s => s.status === 'dijadwalkan').length;
 
   return (
     <div className="space-y-6 pb-16">
@@ -86,7 +150,7 @@ export default function CounselingView() {
 
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowModal(true)}
+            onClick={openModal}
             className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white text-xs font-semibold shadow-xs transition-colors"
           >
             <Plus className="w-4 h-4 text-[#f4a024]" /> Ajukan Jadwal Konsultasi
@@ -107,8 +171,8 @@ export default function CounselingView() {
             </p>
           </div>
           <div className="mt-6 pt-4 border-t border-white/20 text-xs text-slate-300">
-            <div>?? Ruang BK Lantai 2 Gedung Utama</div>
-            <div className="mt-1 text-[#f4a024] font-semibold">Konselor: Rina Marlina, S.Psi</div>
+            <div className="flex items-center gap-1.5"><MapPin className="w-3.5 h-3.5 text-[#f4a024]" /> Ruang BK Lantai 2 Gedung Utama</div>
+            <div className="mt-1 text-[#f4a024] font-semibold">Konselor: {counselorName}</div>
           </div>
         </div>
 
@@ -162,7 +226,7 @@ export default function CounselingView() {
           <h3 className="text-sm font-bold text-[#002147] flex items-center gap-2">
             <Calendar className="w-4 h-4 text-[#f4a024]" /> Jadwal & Catatan Sesi Bimbingan Siswa
           </h3>
-          <span className="text-xs text-slate-500 font-medium">Total: {sessions.length} Sesi Terdaftar</span>
+          <span className="text-xs text-slate-500 font-medium">Total: {sessions.length} Sesi • {scheduledCount} Dijadwalkan</span>
         </div>
 
         <div className="overflow-x-auto">
@@ -180,6 +244,11 @@ export default function CounselingView() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
+              {sessions.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">{loadError || 'Belum ada sesi konseling terdaftar.'}</td>
+                </tr>
+              )}
               {sessions.map((s, idx) => (
                 <tr key={s.id} className="hover:bg-slate-50 transition-colors">
                   <td className="py-3.5 px-4 font-semibold text-slate-400">{idx + 1}</td>
@@ -200,7 +269,7 @@ export default function CounselingView() {
                   <td className="py-3.5 px-3 text-center font-medium text-slate-700">{s.counselor_name}</td>
                   <td className="py-3.5 px-3 text-center">
                     <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                      s.status === 'selesai' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                      s.status === 'selesai' ? 'bg-emerald-100 text-emerald-800' : s.status === 'dibatalkan' ? 'bg-rose-100 text-rose-800' : 'bg-amber-100 text-amber-800'
                     }`}>
                       {s.status}
                     </span>
@@ -221,6 +290,64 @@ export default function CounselingView() {
           <div className="bg-white rounded-2xl border border-slate-200 max-w-md w-full p-6 shadow-2xl animate-in zoom-in-95">
             <h3 className="text-base font-bold text-[#002147] mb-3">Pengajuan Jadwal Konseling Privat</h3>
             <form onSubmit={handleBookingSubmit} className="space-y-3 text-xs">
+              {canListStudents && students.length > 0 ? (
+                <div>
+                  <label className="block text-slate-600 font-semibold mb-1">Peserta Didik</label>
+                  <select
+                    value={studentId}
+                    onChange={(e) => handleStudentPick(e.target.value)}
+                    className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 bg-white"
+                    required
+                  >
+                    <option value="">-- Pilih siswa dari Buku Induk --</option>
+                    {students.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}{s.class_name ? ` — ${s.class_name}` : ''}</option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-600 font-semibold mb-1">Nama Siswa</label>
+                    <input
+                      type="text"
+                      value={studentName}
+                      onChange={(e) => setStudentName(e.target.value)}
+                      readOnly={currentRole === 'siswa'}
+                      placeholder="Nama lengkap siswa"
+                      className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 read-only:bg-slate-50"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-600 font-semibold mb-1">Kelas</label>
+                    <input
+                      type="text"
+                      value={className}
+                      onChange={(e) => setClassName(e.target.value)}
+                      placeholder="Contoh: X MIPA 1"
+                      className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
+                      required
+                    />
+                  </div>
+                  {!isStudentAccount && (
+                    <div className="col-span-2">
+                      <label className="block text-slate-600 font-semibold mb-1">ID Siswa (Buku Induk)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={studentId}
+                        onChange={(e) => setStudentId(e.target.value)}
+                        className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
+                        required
+                      />
+                      <p className="text-[10px] text-slate-400 mt-1">
+                        {canListStudents && !studentsLoaded ? 'Memuat daftar siswa Buku Induk…' : 'Daftar siswa Buku Induk tidak tersedia untuk peran Anda; isi ID siswa secara manual.'}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
               <div>
                 <label className="block text-slate-600 font-semibold mb-1">Bidang Layanan</label>
                 <select
@@ -253,6 +380,7 @@ export default function CounselingView() {
                   <input
                     type="date"
                     value={sessionDate}
+                    min={toLocalDateString()}
                     onChange={(e) => setSessionDate(e.target.value)}
                     className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
                     required
@@ -295,9 +423,10 @@ export default function CounselingView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white font-semibold"
+                  disabled={isSubmitting}
+                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] disabled:opacity-50 text-white font-semibold"
                 >
-                  Ajukan Sesi
+                  {isSubmitting ? 'Mengirim...' : 'Ajukan Sesi'}
                 </button>
               </div>
             </form>

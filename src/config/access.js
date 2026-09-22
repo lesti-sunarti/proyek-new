@@ -10,8 +10,9 @@ export const ROLE_PERMISSIONS = {
   // Kompatibilitas akun lokal lama.
   admin: ['*'],
   guru: ['attendance', 'cbt', 'academic', 'elearning', 'erapor', 'extracurricular', 'counseling', 'uks', 'career', 'feedback', 'walikelas'],
-  siswa: ['attendance', 'cbt', 'elearning', 'erapor', 'extracurricular', 'career', 'feedback', 'kantin', 'topup'],
-  ortu: ['attendance', 'spp', 'ortu_dashboard', 'erapor', 'feedback'],
+  // Siswa & orang tua: data pribadi (SPP, presensi, nilai, izin UKS) dibatasi server hanya ke siswa terkait akun.
+  siswa: ['attendance', 'cbt', 'elearning', 'erapor', 'extracurricular', 'career', 'feedback', 'kantin', 'topup', 'spp', 'uks'],
+  ortu: ['attendance', 'spp', 'ortu_dashboard', 'erapor', 'feedback', 'uks'],
 };
 
 export function roleCanAccess(role, moduleKey) {

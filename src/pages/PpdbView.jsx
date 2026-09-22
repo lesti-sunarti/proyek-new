@@ -58,24 +58,29 @@ export default function PpdbView() {
   const [adminStatusFilter, setAdminStatusFilter] = useState('all');
 
   const loadPpdb = async () => {
+    if (!canManageAdmissions) return; // tamu tidak boleh memanggil endpoint privat (akan 401)
     try {
       setLoadingList(true);
       const res = await fetch('/api/ppdb/list');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setPpdbList(data);
-      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data?.success === false) throw new Error(data?.message || `HTTP ${res.status}`);
+      setPpdbList(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Error loading PPDB list:', err);
+      showToast('Gagal memuat daftar pendaftar: ' + err.message, 'error');
     } finally {
       setLoadingList(false);
     }
   };
 
   useEffect(() => {
-    if (canManageAdmissions) loadPpdb();
-    else setPpdbList([]);
+    if (canManageAdmissions) {
+      loadPpdb();
+    } else {
+      // Hak akses hilang (misal logout): kosongkan data panitia & kembali ke tab publik
+      setPpdbList([]);
+      setActiveTab('register');
+    }
   }, [canManageAdmissions]);
 
   const handleResetForm = () => {
@@ -107,8 +112,26 @@ export default function PpdbView() {
     if (!cleanSchool) {
       return showToast('Harap masukkan Asal Sekolah SMP/MTs', 'error');
     }
+    if (!/^\d{10}$/.test(cleanNisn)) {
+      return showToast('NISN harus terdiri dari 10 digit angka', 'error');
+    }
+    const cleanBirth = birthPlaceDate.trim();
+    const cleanParentName = parentName.trim();
+    const cleanParentPhone = parentPhone.replace(/[^0-9+]/g, '');
+    if (!cleanBirth) {
+      return showToast('Harap isi Tempat, Tanggal Lahir calon siswa', 'error');
+    }
+    if (!cleanParentName) {
+      return showToast('Harap isi Nama Orang Tua / Wali', 'error');
+    }
+    if (cleanParentPhone.length < 9) {
+      return showToast('Nomor WhatsApp Orang Tua tidak valid (minimal 9 digit)', 'error');
+    }
 
-    const cleanScoreNum = Number(String(averageScore).replace(',', '.')) || 85.0;
+    const cleanScoreNum = Number(String(averageScore).replace(',', '.'));
+    if (!Number.isFinite(cleanScoreNum) || cleanScoreNum < 0 || cleanScoreNum > 100) {
+      return showToast('Rata-rata nilai rapor harus berupa angka 0 - 100', 'error');
+    }
 
     setIsSubmitting(true);
 
@@ -117,12 +140,12 @@ export default function PpdbView() {
         full_name: cleanName,
         nisn: cleanNisn,
         gender,
-        birth_place_date: birthPlaceDate.trim() || 'Bangkalan, 13 Maret 2008',
+        birth_place_date: cleanBirth,
         track,
         previous_school: cleanSchool,
         average_score: cleanScoreNum,
-        parent_name: parentName.trim() || 'Orang Tua / Wali',
-        parent_phone: parentPhone.trim() || '083866779608',
+        parent_name: cleanParentName,
+        parent_phone: cleanParentPhone,
         address: address.trim() || '-'
       };
 
@@ -137,9 +160,9 @@ export default function PpdbView() {
       });
       clearTimeout(timeoutId);
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
 
-      if (!res.ok || !data.success) {
+      if (!res.ok || !data.success || !data.registration_no) {
         throw new Error(data.message || 'Terjadi kesalahan saat memproses pendaftaran');
       }
 
@@ -162,7 +185,7 @@ export default function PpdbView() {
       setShowSuccessModal(true);
       showToast(data.message || 'Formulir PPDB Berhasil Terkirim!', 'success');
       handleResetForm();
-      loadPpdb();
+      if (canManageAdmissions) loadPpdb();
     } catch (err) {
       console.error('Registration failed:', err);
       const errMsg = err.name === 'AbortError' 
@@ -181,7 +204,7 @@ export default function PpdbView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus })
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.success) throw new Error(data.message || 'Gagal mengubah status');
       showToast(data.message || `Status diubah menjadi: ${newStatus.toUpperCase()}`, 'success');
       loadPpdb();
@@ -194,7 +217,7 @@ export default function PpdbView() {
     if (!window.confirm(`Hapus data pendaftaran calon siswa: ${studentName}?`)) return;
     try {
       const res = await fetch(`/api/ppdb/${id}`, { method: 'DELETE' });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.success) throw new Error(data.message || 'Gagal menghapus');
       showToast(data.message || 'Data pendaftar berhasil dihapus', 'success');
       loadPpdb();
@@ -203,9 +226,14 @@ export default function PpdbView() {
     }
   };
 
-  const copyToClipboard = (text, label) => {
-    navigator.clipboard.writeText(text);
-    showToast(`${label} berhasil disalin ke clipboard!`, 'info');
+  const copyToClipboard = async (text, label) => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard tidak tersedia');
+      await navigator.clipboard.writeText(text);
+      showToast(`${label} berhasil disalin ke clipboard!`, 'info');
+    } catch {
+      showToast(`Tidak dapat menyalin otomatis. ${label}: ${text}`, 'error');
+    }
   };
 
   // Filtered admin list
@@ -213,7 +241,7 @@ export default function PpdbView() {
     const query = adminSearch.toLowerCase();
     const matchQuery = !query || 
       item.full_name?.toLowerCase().includes(query) ||
-      item.nisn?.includes(query) ||
+      String(item.nisn ?? '').includes(query) ||
       item.registration_no?.toLowerCase().includes(query) ||
       item.previous_school?.toLowerCase().includes(query);
 
@@ -310,7 +338,8 @@ export default function PpdbView() {
                   <input
                     type="text"
                     required
-                    maxLength={16}
+                    maxLength={10}
+                    inputMode="numeric"
                     placeholder="10 digit NISN..."
                     value={nisn}
                     onChange={(e) => setNisn(e.target.value.replace(/[^0-9]/g, ''))}
@@ -373,9 +402,12 @@ export default function PpdbView() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Tempat, Tanggal Lahir:</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Tempat, Tanggal Lahir: <span className="text-rose-500">*</span>
+                  </label>
                   <input
                     type="text"
+                    required
                     placeholder="Contoh: Bangkalan, 13 Maret 2008"
                     value={birthPlaceDate}
                     onChange={(e) => setBirthPlaceDate(e.target.value)}
@@ -386,9 +418,12 @@ export default function PpdbView() {
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Nama Orang Tua / Wali:</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Nama Orang Tua / Wali: <span className="text-rose-500">*</span>
+                  </label>
                   <input
                     type="text"
+                    required
                     placeholder="Nama ayah / ibu..."
                     value={parentName}
                     onChange={(e) => setParentName(e.target.value)}
@@ -396,9 +431,13 @@ export default function PpdbView() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Nomor WhatsApp Orang Tua:</label>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Nomor WhatsApp Orang Tua: <span className="text-rose-500">*</span>
+                  </label>
                   <input
-                    type="text"
+                    type="tel"
+                    required
+                    inputMode="tel"
                     placeholder="0838..."
                     value={parentPhone}
                     onChange={(e) => setParentPhone(e.target.value)}
@@ -549,8 +588,8 @@ export default function PpdbView() {
         </div>
       )}
 
-      {/* VERIFIKASI ADMIN TAB */}
-      {activeTab === 'admin_list' && (
+      {/* VERIFIKASI ADMIN TAB (hanya panitia yang berhak) */}
+      {activeTab === 'admin_list' && canManageAdmissions && (
         <div className="bg-white border border-slate-200 rounded-3xl p-6 space-y-5 shadow-sm">
           
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">

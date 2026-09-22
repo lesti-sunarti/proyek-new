@@ -65,8 +65,8 @@ export default function CareerCenterView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ opportunity_id: selectedOpportunity.id, applicant_name: candidate.name, applicant_role: currentRole, class_name: candidate.class_name, notes: candidate.notes }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.success === false) throw new Error(data.message || 'Permintaan tidak dapat diproses.');
       showToast(data.message, 'success');
       setSelectedOpportunity(null);
       setCandidate((previous) => ({ ...previous, notes: '' }));
@@ -85,8 +85,8 @@ export default function CareerCenterView() {
       const response = await fetch('/api/careers/opportunities', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newOpportunity),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.success === false) throw new Error(data.message || 'Permintaan tidak dapat diproses.');
       showToast(data.message, 'success');
       setShowCreate(false);
       setNewOpportunity(emptyOpportunity);

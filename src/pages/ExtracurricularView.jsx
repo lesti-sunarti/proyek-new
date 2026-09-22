@@ -7,8 +7,6 @@ import {
   MapPin, 
   UserCheck, 
   Award, 
-  Plus, 
-  CheckCircle2, 
   Shield, 
   Compass, 
   Cpu, 
@@ -18,46 +16,62 @@ import {
 } from 'lucide-react';
 
 export default function ExtracurricularView() {
-  const { currentUser, currentRole, showToast } = useAuth();
+  const { currentUser, showToast } = useAuth();
   const [ekskulList, setEkskulList] = useState([]);
   const [joinModal, setJoinModal] = useState({ open: false, ekskul: null });
-  const [studentName, setStudentName] = useState('Aditya Pratama Putra');
-  const [studentClass, setStudentClass] = useState('X MIPA 1');
+  const [studentName, setStudentName] = useState(currentUser?.name || '');
+  const [studentClass, setStudentClass] = useState('');
   const [reason, setReason] = useState('Ingin mengasah minat, bakat, dan disiplin diri.');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Nama pendaftar mengikuti akun yang sedang login (bukan nama demo statis) dan tetap dapat diubah.
+  useEffect(() => {
+    setStudentName(currentUser?.name || '');
+  }, [currentUser?.name]);
 
   const fetchEkskuls = () => {
     fetch('/api/extracurriculars')
-      .then(res => res.json())
-      .then(data => setEkskulList(data))
-      .catch(() => {});
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.success === false) throw new Error(data.message || 'Daftar ekstrakurikuler belum dapat dimuat.');
+        setEkskulList(Array.isArray(data) ? data : []);
+      })
+      .catch((error) => { setEkskulList([]); showToast(error.message, 'error'); });
   };
 
   useEffect(() => {
     fetchEkskuls();
   }, []);
 
-  const handleJoinSubmit = (e) => {
+  const totalMembers = ekskulList.reduce((sum, item) => sum + (Number(item.member_count) || 0), 0);
+
+  const handleJoinSubmit = async (e) => {
     e.preventDefault();
     if (!joinModal.ekskul) return;
+    if (!studentName.trim() || !studentClass.trim()) return showToast('Nama siswa dan kelas wajib diisi', 'error');
 
-    fetch('/api/extracurriculars/join', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        extracurricular_id: joinModal.ekskul.id,
-        student_name: studentName,
-        class_name: studentClass
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          showToast(data.message, 'success');
-          setJoinModal({ open: false, ekskul: null });
-          fetchEkskuls();
-        }
-      })
-      .catch(() => showToast('Gagal mendaftar ekskul', 'error'));
+    setIsSubmitting(true);
+    try {
+      const res = await fetch('/api/extracurriculars/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          extracurricular_id: joinModal.ekskul.id,
+          student_name: studentName.trim(),
+          class_name: studentClass.trim(),
+          reason: reason.trim()
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal mendaftar ekskul');
+      showToast(data.message || 'Pendaftaran ekstrakurikuler berhasil', 'success');
+      setJoinModal({ open: false, ekskul: null });
+      fetchEkskuls();
+    } catch (error) {
+      showToast(error.message || 'Gagal mendaftar ekskul', 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const getIcon = (iconName) => {
@@ -87,7 +101,7 @@ export default function ExtracurricularView() {
 
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 text-[#002147] border border-amber-200 text-xs font-bold">
-            <Sparkles className="w-4 h-4 text-[#f4a024]" /> 6 Cabang Ekskul Unggulan
+            <Sparkles className="w-4 h-4 text-[#f4a024]" /> {ekskulList.length} Cabang Ekskul Unggulan
           </span>
         </div>
       </div>
@@ -107,13 +121,16 @@ export default function ExtracurricularView() {
             <div className="text-[10px] text-slate-300">Terbina Rutin</div>
           </div>
           <div className="bg-white/10 px-4 py-2 rounded-xl text-center backdrop-blur-xs border border-white/20">
-            <div className="text-xl font-black text-[#f4a024]">362</div>
+            <div className="text-xl font-black text-[#f4a024]">{totalMembers.toLocaleString('id-ID')}</div>
             <div className="text-[10px] text-slate-300">Anggota Aktif</div>
           </div>
         </div>
       </div>
 
       {/* GRID DAFTAR EKSTRAKURIKULER */}
+      {ekskulList.length === 0 && (
+        <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-xs text-slate-500">Belum ada ekstrakurikuler yang terdaftar.</div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
         {ekskulList.map((e) => (
           <div key={e.id} className="bg-white border border-slate-200 rounded-2xl p-5 shadow-xs flex flex-col justify-between hover:shadow-md transition-shadow">
@@ -156,7 +173,7 @@ export default function ExtracurricularView() {
             <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-1.5 text-xs text-slate-500">
                 <Users className="w-3.5 h-3.5 text-slate-400" />
-                <span className="font-semibold text-slate-700">{e.member_count} Siswa</span>
+                <span className="font-semibold text-slate-700">{Number(e.member_count) || 0} Siswa</span>
               </div>
               <button
                 onClick={() => setJoinModal({ open: true, ekskul: e })}
@@ -186,6 +203,7 @@ export default function ExtracurricularView() {
                   type="text"
                   value={studentName}
                   onChange={(e) => setStudentName(e.target.value)}
+                  placeholder="Nama lengkap siswa"
                   className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
                   required
                 />
@@ -197,6 +215,7 @@ export default function ExtracurricularView() {
                   type="text"
                   value={studentClass}
                   onChange={(e) => setStudentClass(e.target.value)}
+                  placeholder="Contoh: X MIPA 1"
                   className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
                   required
                 />
@@ -223,9 +242,10 @@ export default function ExtracurricularView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white font-semibold"
+                  disabled={isSubmitting}
+                  className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white font-semibold disabled:opacity-60"
                 >
-                  Kirim Pendaftaran
+                  {isSubmitting ? 'Mengirim…' : 'Kirim Pendaftaran'}
                 </button>
               </div>
             </form>

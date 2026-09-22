@@ -1,52 +1,72 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { Radio, Send, Bell, AlertTriangle, CheckCircle2, User, Clock } from 'lucide-react';
+import { Radio, Send, Bell, AlertTriangle, Clock, Lock } from 'lucide-react';
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan.');
+  return data;
+}
 
 export default function BroadcastView() {
-  const { broadcasts, showToast, setUrgentNotice } = useAuth();
+  const { currentUser, canAccess, showToast, setUrgentNotice } = useAuth();
+  // GET /api/broadcasts publik; POST hanya untuk akun dengan modul broadcast.
+  const canBroadcast = canAccess('broadcast');
   const [broadcastList, setBroadcastList] = useState([]);
   const [title, setTitle] = useState('');
   const [message, setMessage] = useState('');
   const [targetRole, setTargetRole] = useState('semua');
   const [isUrgent, setIsUrgent] = useState(false);
+  const [isSending, setIsSending] = useState(false);
 
-  const loadBroadcasts = () => {
-    fetch('/api/broadcasts')
-      .then(r => r.json())
-      .then(data => setBroadcastList(data))
-      .catch(() => {});
-  };
+  const loadBroadcasts = () => requestJson('/api/broadcasts')
+    .then((data) => {
+      const list = Array.isArray(data) ? data : [];
+      setBroadcastList(list);
+      return list;
+    })
+    .catch((error) => {
+      setBroadcastList([]);
+      showToast(error.message, 'error');
+      return [];
+    });
 
   useEffect(() => {
     loadBroadcasts();
   }, []);
 
-  const handleSendBroadcast = (e) => {
+  const handleSendBroadcast = async (e) => {
     e.preventDefault();
-    if (!title || !message) return showToast('Judul dan isi pengumuman harus diisi', 'error');
+    if (!title.trim() || !message.trim()) return showToast('Judul dan isi pengumuman harus diisi', 'error');
 
-    fetch('/api/broadcasts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title,
-        message,
-        target_role: targetRole,
-        sender_name: 'Kepala Sekolah & Tim Manajemen',
-        is_urgent: isUrgent ? 1 : 0
-      })
-    })
-      .then(r => r.json())
-      .then(data => {
-        showToast(data.message, 'success');
-        if (isUrgent) {
-          setUrgentNotice({ title, message });
-        }
-        setTitle('');
-        setMessage('');
-        setIsUrgent(false);
-        loadBroadcasts();
+    setIsSending(true);
+    try {
+      const data = await requestJson('/api/broadcasts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: title.trim(),
+          message: message.trim(),
+          target_role: targetRole,
+          sender_name: currentUser?.badge ? `${currentUser.name} — ${currentUser.badge}` : (currentUser?.name || 'Kepala Sekolah & Tim Manajemen'),
+          is_urgent: isUrgent ? 1 : 0
+        })
       });
+      showToast(data.message || 'Pengumuman berhasil disiarkan', 'success');
+      const list = await loadBroadcasts();
+      if (isUrgent) {
+        // Banner darurat memakai record terbaru dari server agar konsisten dengan AuthContext.
+        setUrgentNotice(list.find((item) => Number(item.is_urgent) === 1) || { title: title.trim(), message: message.trim(), is_urgent: 1 });
+      }
+      setTitle('');
+      setMessage('');
+      setIsUrgent(false);
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   return (
@@ -73,63 +93,73 @@ export default function BroadcastView() {
             <Send className="w-4 h-4 text-emerald-400" /> Siarkan Pengumuman Baru
           </h3>
 
-          <form onSubmit={handleSendBroadcast} className="space-y-3">
-            <div>
-              <label className="block text-xs text-slate-500 mb-1">Judul Pengumuman:</label>
-              <input
-                type="text"
-                placeholder="Contoh: Jadwal Libur Awal Ramadhan 1446 H"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                className="w-full bg-white border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
-              />
-            </div>
+          {canBroadcast ? (
+            <form onSubmit={handleSendBroadcast} className="space-y-3">
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Judul Pengumuman:</label>
+                <input
+                  type="text"
+                  placeholder="Contoh: Jadwal Libur Awal Ramadhan 1446 H"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
+                />
+              </div>
 
-            <div>
-              <label className="block text-xs text-slate-500 mb-1">Target Penerima Pesan:</label>
-              <select
-                value={targetRole}
-                onChange={(e) => setTargetRole(e.target.value)}
-                className="w-full bg-white border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Target Penerima Pesan:</label>
+                <select
+                  value={targetRole}
+                  onChange={(e) => setTargetRole(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
+                >
+                  <option value="semua">Semua Warga Sekolah (Guru, Siswa, Ortu)</option>
+                  <option value="guru">Khusus Tenaga Pendidik & Staf (Guru)</option>
+                  <option value="siswa">Khusus Peserta Didik (Siswa)</option>
+                  <option value="ortu">Khusus Orang Tua / Wali Murid</option>
+                </select>
+              </div>
+
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  id="urgentCheck"
+                  checked={isUrgent}
+                  onChange={(e) => setIsUrgent(e.target.checked)}
+                  className="rounded bg-white border-slate-200 text-rose-600 focus:ring-0"
+                />
+                <label htmlFor="urgentCheck" className="text-xs text-slate-600 font-semibold cursor-pointer">
+                  Tandai sebagai <span className="text-rose-400">URGENT (Banner Merah Berkedip)</span>
+                </label>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Isi Pesan Broadcast:</label>
+                <textarea
+                  rows={5}
+                  placeholder="Tuliskan instruksi pengumuman secara jelas..."
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-xl p-3 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
+                />
+              </div>
+
+              <p className="text-[11px] text-slate-500">Pengirim tercatat: <strong className="text-slate-700">{currentUser?.name}</strong></p>
+
+              <button
+                type="submit"
+                disabled={isSending}
+                className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2 disabled:opacity-60"
               >
-                <option value="semua">Semua Warga Sekolah (Guru, Siswa, Ortu)</option>
-                <option value="guru">Khusus Tenaga Pendidik & Staf (Guru)</option>
-                <option value="siswa">Khusus Peserta Didik (Siswa)</option>
-                <option value="ortu">Khusus Orang Tua / Wali Murid</option>
-              </select>
+                <Radio className={`w-4 h-4 ${isSending ? '' : 'animate-pulse'}`} /> {isSending ? 'Menyiarkan…' : 'Siarkan Pengumuman Sekarang'}
+              </button>
+            </form>
+          ) : (
+            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 text-xs text-slate-500 flex items-start gap-2">
+              <Lock className="w-4 h-4 text-slate-400 shrink-0 mt-0.5" />
+              <span>Penyiaran pengumuman hanya dapat dilakukan oleh akun dengan hak akses Broadcast (Kepala Sekolah, Kepala TU, atau Kepala BK). Anda tetap dapat membaca riwayat pengumuman di samping.</span>
             </div>
-
-            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center gap-3">
-              <input
-                type="checkbox"
-                id="urgentCheck"
-                checked={isUrgent}
-                onChange={(e) => setIsUrgent(e.target.checked)}
-                className="rounded bg-white border-slate-200 text-rose-600 focus:ring-0"
-              />
-              <label htmlFor="urgentCheck" className="text-xs text-slate-600 font-semibold cursor-pointer">
-                Tandai sebagai <span className="text-rose-400">URGENT (Banner Merah Berkedip)</span>
-              </label>
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-500 mb-1">Isi Pesan Broadcast:</label>
-              <textarea
-                rows={5}
-                placeholder="Tuliskan instruksi pengumuman secara jelas..."
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                className="w-full bg-white border border-slate-300 rounded-xl p-3 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
-              />
-            </div>
-
-            <button
-              type="submit"
-              className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2"
-            >
-              <Radio className="w-4 h-4 animate-pulse" /> Siarkan Pengumuman Sekarang
-            </button>
-          </form>
+          )}
         </div>
 
         {/* Daftar Broadcast Terkirim (Col 7) */}
@@ -139,26 +169,29 @@ export default function BroadcastView() {
           </h3>
 
           <div className="space-y-3">
+            {broadcastList.length === 0 && (
+              <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-xs text-slate-500">Belum ada pengumuman yang disiarkan.</div>
+            )}
             {broadcastList.map((b) => (
               <div
                 key={b.id}
                 className={`p-5 rounded-2xl border space-y-3 transition-colors ${
-                  b.is_urgent ? 'bg-rose-950/20 border-rose-500/40' : 'bg-slate-50 border-slate-200'
+                  b.is_urgent ? 'bg-rose-50 border-rose-300' : 'bg-slate-50 border-slate-200'
                 }`}
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     {b.is_urgent ? (
-                      <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-rose-500/20 text-rose-400 flex items-center gap-1">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-rose-500/20 text-rose-500 flex items-center gap-1">
                         <AlertTriangle className="w-3 h-3" /> Urgent
                       </span>
                     ) : (
-                      <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-400">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-500">
                         Info Resmi
                       </span>
                     )}
                     <span className="text-[10px] text-slate-500 uppercase font-semibold">
-                      Target: {b.target_role}
+                      Target: {b.target_role || 'semua'}
                     </span>
                   </div>
 
@@ -169,7 +202,7 @@ export default function BroadcastView() {
 
                 <div>
                   <h4 className="text-sm font-bold text-slate-900">{b.title}</h4>
-                  <p className="text-xs text-slate-600 mt-1 leading-relaxed">{b.message}</p>
+                  <p className="text-xs text-slate-600 mt-1 leading-relaxed whitespace-pre-line">{b.message}</p>
                 </div>
 
                 <div className="text-[11px] text-slate-500 pt-2 border-t border-slate-200">

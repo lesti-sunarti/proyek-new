@@ -67,25 +67,29 @@
 
 /* Print Styling for E-Rapor, Invoices, ID Cards, and Pay Slips */
 @media print {
+  @page {
+    margin: 12mm;
+  }
+
   body {
     background: white !important;
     color: black !important;
     font-family: 'DM Sans', sans-serif !important;
   }
-  
-  /* Hide all regular screen elements */
+
+  /* Sembunyikan seluruh elemen layar; hanya area cetak yang ditampilkan */
   body * {
     visibility: hidden;
   }
-  
-  /* Force display of printable areas overriding Tailwind 'hidden' */
-  .printable-area, 
+
+  .printable-area,
   .printable-area * {
     visibility: visible !important;
-    display: block !important;
   }
 
+  /* Paksa tampil walau memakai kelas Tailwind `hidden`, tanpa merusak layout tabel */
   .printable-area {
+    display: block !important;
     position: absolute !important;
     left: 0 !important;
     top: 0 !important;
@@ -95,26 +99,57 @@
     padding: 15px !important;
     color: black !important;
     background: white !important;
+    box-shadow: none !important;
     z-index: 999999 !important;
   }
 
+  .printable-area .hidden {
+    display: block !important;
+  }
+
   .printable-area table {
+    display: table !important;
     width: 100% !important;
     border-collapse: collapse !important;
   }
 
-  .printable-area th, 
+  .printable-area thead {
+    display: table-header-group !important;
+  }
+
+  .printable-area tbody {
+    display: table-row-group !important;
+  }
+
+  .printable-area tfoot {
+    display: table-footer-group !important;
+  }
+
+  .printable-area tr {
+    display: table-row !important;
+  }
+
+  .printable-area th,
   .printable-area td {
+    display: table-cell !important;
     border: 1px solid #333 !important;
     padding: 6px 8px !important;
   }
 
-  /* Support flex in print if child has flex-row */
   .printable-area .flex {
     display: flex !important;
   }
 
-  .no-print {
+  .printable-area .grid {
+    display: grid !important;
+  }
+
+  .printable-area img {
+    max-width: 100% !important;
+  }
+
+  .no-print,
+  .no-print * {
     display: none !important;
     visibility: hidden !important;
   }

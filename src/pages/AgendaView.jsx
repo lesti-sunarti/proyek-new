@@ -15,9 +15,34 @@ import {
   Filter
 } from 'lucide-react';
 
+// Parse 'YYYY-MM-DD' sebagai tanggal LOKAL. new Date('YYYY-MM-DD') dibaca sebagai UTC sehingga
+// di zona WIB agenda hari ini terhitung "1 Hari Lagi" dan bisa bergeser hari di zona lain.
+const parseLocalDate = (value) => {
+  if (!value) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value));
+  const date = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const formatEventDate = (value) => {
+  const date = parseLocalDate(value);
+  return date ? date.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : (value || '-');
+};
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
+
 export default function AgendaView() {
-  const { currentRole, isStaff, showToast } = useAuth();
+  const { canAccess, showToast } = useAuth();
+  // Tambah/hapus agenda memerlukan modul 'broadcast' (server menolak 403 untuk staf lain); halaman ini publik.
+  const canManageAgenda = canAccess('broadcast');
   const [agendas, setAgendas] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterAudience, setFilterAudience] = useState('all'); // all, siswa, guru, ortu, semua
@@ -34,14 +59,9 @@ export default function AgendaView() {
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const loadAgendas = () => {
-    fetch('/api/agenda')
-      .then(r => r.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setAgendas(data);
-        }
-      })
-      .catch(() => {});
+    fetchJson('/api/agenda')
+      .then(data => { setAgendas(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setAgendas([]); setLoadError(err.message || 'Agenda belum dapat dimuat.'); });
   };
 
   useEffect(() => {
@@ -50,13 +70,18 @@ export default function AgendaView() {
 
   const handleAddAgenda = async (e) => {
     e.preventDefault();
+    if (isSubmitting) return;
+    if (!canManageAgenda) return showToast('Akun Anda tidak memiliki hak untuk menambah agenda.', 'error');
     if (!title.trim() || !eventDate) {
       return showToast('Judul dan tanggal agenda harus diisi', 'error');
+    }
+    if (startTime && endTime && endTime <= startTime) {
+      return showToast('Jam selesai harus setelah jam mulai', 'error');
     }
 
     setIsSubmitting(true);
     try {
-      const res = await fetch('/api/agenda', {
+      const data = await fetchJson('/api/agenda', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -65,12 +90,10 @@ export default function AgendaView() {
           event_date: eventDate,
           start_time: startTime,
           end_time: endTime,
-          location: location.trim(),
+          location: location.trim() || 'Lingkungan Sekolah',
           audience
         })
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || 'Gagal menyimpan agenda');
 
       showToast(data.message || 'Agenda kegiatan sekolah berhasil ditambahkan', 'success');
       setShowAddModal(false);
@@ -88,9 +111,7 @@ export default function AgendaView() {
   const handleDeleteAgenda = async (id, agendaTitle) => {
     if (!window.confirm(`Hapus agenda kegiatan: "${agendaTitle}"?`)) return;
     try {
-      const res = await fetch(`/api/agenda/${id}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || 'Gagal menghapus');
+      const data = await fetchJson(`/api/agenda/${id}`, { method: 'DELETE' });
       showToast(data.message || 'Agenda kegiatan berhasil dihapus', 'success');
       loadAgendas();
     } catch (err) {
@@ -98,13 +119,14 @@ export default function AgendaView() {
     }
   };
 
-  // Hitung hari tersisa
+  // Hitung hari tersisa (berbasis tanggal lokal)
   const getDaysRemaining = (targetDateStr) => {
+    const target = parseLocalDate(targetDateStr);
+    if (!target) return 'Tanggal tidak valid';
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const target = new Date(targetDateStr);
-    const diffTime = target - today;
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    target.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((target - today) / (1000 * 60 * 60 * 24));
     if (diffDays === 0) return 'Hari ini!';
     if (diffDays < 0) return 'Selesai';
     return `${diffDays} Hari Lagi`;
@@ -112,7 +134,7 @@ export default function AgendaView() {
 
   // Filtered agendas
   const filteredAgendas = agendas.filter(ag => {
-    const q = searchQuery.toLowerCase();
+    const q = searchQuery.trim().toLowerCase();
     const matchQuery = !q || 
       ag.title?.toLowerCase().includes(q) ||
       ag.description?.toLowerCase().includes(q) ||
@@ -121,7 +143,7 @@ export default function AgendaView() {
     const matchAudience = filterAudience === 'all' || ag.audience === filterAudience;
 
     const daysLeft = getDaysRemaining(ag.event_date);
-    const isCompleted = daysLeft.includes('Selesai');
+    const isCompleted = daysLeft === 'Selesai';
     const matchStatus = filterStatus === 'all' || 
       (filterStatus === 'upcoming' && !isCompleted) || 
       (filterStatus === 'selesai' && isCompleted);
@@ -146,7 +168,7 @@ export default function AgendaView() {
           </p>
         </div>
 
-        {isStaff && (
+        {canManageAgenda && (
           <button
             onClick={() => setShowAddModal(true)}
             className="px-5 py-3 rounded-xl bg-black hover:bg-neutral-800 active:scale-[0.98] text-white text-xs font-black shadow-md flex items-center gap-2 transition-all cursor-pointer shrink-0"
@@ -199,15 +221,17 @@ export default function AgendaView() {
         {filteredAgendas.length === 0 ? (
           <div className="col-span-full py-12 text-center bg-white border-2 border-slate-200 rounded-3xl p-6">
             <Calendar className="w-12 h-12 text-black mx-auto mb-3 opacity-30" />
-            <h3 className="text-base font-black text-black">Tidak Ada Agenda Kegiatan</h3>
+            <h3 className="text-base font-black text-black">{loadError ? 'Agenda Belum Dapat Dimuat' : 'Tidak Ada Agenda Kegiatan'}</h3>
             <p className="text-xs text-black font-medium mt-1">
-              Tidak ditemukan agenda yang sesuai dengan pencarian atau filter yang dipilih.
+              {loadError || (agendas.length === 0
+                ? 'Belum ada agenda kegiatan yang dipublikasikan.'
+                : 'Tidak ditemukan agenda yang sesuai dengan pencarian atau filter yang dipilih.')}
             </p>
           </div>
         ) : (
           filteredAgendas.map((ag) => {
             const daysLeft = getDaysRemaining(ag.event_date);
-            const isCompleted = daysLeft.includes('Selesai');
+            const isCompleted = daysLeft === 'Selesai';
             const isToday = daysLeft === 'Hari ini!';
 
             return (
@@ -232,7 +256,7 @@ export default function AgendaView() {
                         Untuk: {ag.audience}
                       </span>
                       
-                      {isStaff && (
+                      {canManageAgenda && (
                         <button
                           onClick={() => handleDeleteAgenda(ag.id, ag.title)}
                           className="p-1 rounded-lg hover:bg-rose-100 text-black hover:text-rose-700 transition-all"
@@ -258,7 +282,7 @@ export default function AgendaView() {
                   <div className="flex items-center gap-2.5">
                     <Calendar className="w-4 h-4 text-black shrink-0" />
                     <span className="text-black">
-                      {new Date(ag.event_date).toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                      {formatEventDate(ag.event_date)}
                     </span>
                   </div>
                   <div className="flex items-center gap-2.5">
@@ -384,7 +408,7 @@ export default function AgendaView() {
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className="flex-1 py-2.5 rounded-xl bg-black hover:bg-neutral-800 active:scale-[0.98] text-white text-xs font-black shadow-md transition-all cursor-pointer"
+                  className="flex-1 py-2.5 rounded-xl bg-black hover:bg-neutral-800 active:scale-[0.98] text-white text-xs font-black shadow-md transition-all cursor-pointer disabled:opacity-60"
                 >
                   {isSubmitting ? 'Menyimpan...' : 'Simpan Agenda'}
                 </button>

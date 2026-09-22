@@ -12,9 +12,30 @@ export const STAFF_ACCOUNTS = [
 ];
 
 const GUEST = { id: null, role: 'publik', name: 'Pengunjung', title: 'Akses publik sekolah', badge: 'Akses Publik' };
+const ACTIVE_MODULE_KEY = 'school-active-module';
+const ROLE_LABELS = { admin: 'Administrator', guru: 'Guru', siswa: 'Siswa', ortu: 'Orang Tua / Wali' };
+
+// Melengkapi data akun dari server dengan jabatan/badge agar tampilan konsisten
+// baik untuk akun staf maupun akun legacy (admin/guru/siswa/ortu).
+function normalizeUser(user) {
+  if (!user) return GUEST;
+  const accountInfo = STAFF_ACCOUNTS.find((account) => account.role === user.role);
+  const roleLabel = ROLE_LABELS[user.role] || accountInfo?.badge || user.role;
+  return { ...user, title: user.title || accountInfo?.title || roleLabel, badge: user.badge || accountInfo?.badge || roleLabel };
+}
+
+function readStoredModule() {
+  try { return window.sessionStorage.getItem(ACTIVE_MODULE_KEY) || 'portal'; } catch { return 'portal'; }
+}
+
 export function AuthProvider({ children }) {
   const [currentUser, setCurrentUser] = useState(GUEST);
-  const [activeModule, setActiveModule] = useState('portal');
+  // Modul aktif dipersistenkan agar muat ulang halaman tidak melempar pengguna kembali ke portal.
+  const [activeModule, setActiveModuleState] = useState(readStoredModule);
+  const setActiveModule = useCallback((moduleKey) => {
+    setActiveModuleState(moduleKey || 'portal');
+    try { window.sessionStorage.setItem(ACTIVE_MODULE_KEY, moduleKey || 'portal'); } catch { /* penyimpanan sesi tidak tersedia */ }
+  }, []);
   const [toast, setToast] = useState(null);
   const [broadcasts, setBroadcasts] = useState([]);
   const [urgentNotice, setUrgentNotice] = useState(null);
@@ -40,10 +61,9 @@ export function AuthProvider({ children }) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: username.trim(), password }),
       });
-      const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.message || 'Tidak dapat masuk');
-      const accountInfo = STAFF_ACCOUNTS.find((account) => account.role === data.user.role);
-      const user = { ...data.user, title: data.user.title || accountInfo?.title || data.user.role, badge: data.user.badge || accountInfo?.badge || data.user.role };
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success || !data.user) throw new Error(data.message || (response.status === 429 ? 'Terlalu banyak percobaan masuk. Coba lagi beberapa menit.' : 'Tidak dapat masuk'));
+      const user = normalizeUser(data.user);
       setCurrentUser(user);
       sessionStorage.setItem('school-session', JSON.stringify(user));
       setIsLoginOpen(false);
@@ -71,8 +91,9 @@ export function AuthProvider({ children }) {
       return response.json();
     }).then((data) => {
       if (!isMounted || !data?.user) return;
-      setCurrentUser(data.user);
-      sessionStorage.setItem('school-session', JSON.stringify(data.user));
+      const user = normalizeUser(data.user);
+      setCurrentUser(user);
+      sessionStorage.setItem('school-session', JSON.stringify(user));
     }).catch(() => {
       sessionStorage.removeItem('school-session');
       if (isMounted) setCurrentUser(GUEST);
@@ -98,12 +119,14 @@ export function AuthProvider({ children }) {
   }, [checkServerOnline]);
 
   useEffect(() => {
-    fetch('/api/broadcasts').then((res) => res.json()).then((data) => {
-      if (!Array.isArray(data)) return;
+    let isMounted = true;
+    fetch('/api/broadcasts').then((res) => (res.ok ? res.json() : [])).then((data) => {
+      if (!isMounted || !Array.isArray(data)) return;
       setBroadcasts(data);
-      const urgent = data.find((item) => item.is_urgent === 1);
+      const urgent = data.find((item) => Number(item.is_urgent) === 1);
       if (urgent) setUrgentNotice(urgent);
     }).catch(() => {});
+    return () => { isMounted = false; };
   }, []);
 
   const value = useMemo(() => ({

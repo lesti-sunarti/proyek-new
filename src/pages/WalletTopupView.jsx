@@ -26,8 +26,10 @@ import {
 } from 'lucide-react';
 
 export default function WalletTopupView() {
-  const { currentUser, currentRole, showToast } = useAuth();
+  const { currentUser, currentRole, isStaff, isAuthenticated, openLogin, showToast } = useAuth();
   const [wallet, setWallet] = useState(null);
+  const [walletError, setWalletError] = useState('');
+  const [needsLogin, setNeedsLogin] = useState(false);
   const [transactions, setTransactions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [hideBalance, setHideBalance] = useState(false);
@@ -56,32 +58,28 @@ export default function WalletTopupView() {
   const [walletSummary, setWalletSummary] = useState(null);
   const [adminSearch, setAdminSearch] = useState('');
 
-  const fetchWallet = async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`/api/wallet/my-wallet?role=${currentRole}&name=${encodeURIComponent(currentUser.name)}&identifier=${currentUser.studentId || '123'}`);
-      const data = await res.json();
-      if (data.success && data.wallet) {
-        setWallet(data.wallet);
-        fetchTransactions(data.wallet.id);
-      }
-      if (currentRole === 'admin') {
-        fetchAllWallets();
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
+  // Kode booking setor tunai dibuat sekali saat masuk langkah pembayaran (bukan tiap render)
+  const [cashBookingCode, setCashBookingCode] = useState('');
+
+  // Terjemahkan respons non-OK menjadi pesan error; 401 = sesi habis (tampilkan ajakan login)
+  const handleApiFailure = (res, data, fallbackMsg) => {
+    if (res.status === 401) {
+      setNeedsLogin(true);
+      return 'Sesi Anda telah berakhir. Silakan masuk kembali untuk mengakses dompet digital.';
     }
+    return data?.message || fallbackMsg;
   };
 
   const fetchTransactions = async (walletId) => {
+    if (!walletId) return;
     try {
       const res = await fetch(`/api/wallet/transactions/${walletId}`);
-      const data = await res.json();
-      if (data.success) {
-        setTransactions(data.transactions || []);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        handleApiFailure(res, data, '');
+        return;
       }
+      setTransactions(Array.isArray(data.transactions) ? data.transactions : []);
     } catch (err) {
       console.error(err);
     }
@@ -90,25 +88,93 @@ export default function WalletTopupView() {
   const fetchAllWallets = async () => {
     try {
       const res = await fetch('/api/wallet/all');
-      const data = await res.json();
-      if (data.success) {
-        setAllWallets(data.wallets || []);
-        setWalletSummary(data.summary || null);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        handleApiFailure(res, data, '');
+        return;
       }
+      setAllWallets(Array.isArray(data.wallets) ? data.wallets : []);
+      setWalletSummary(data.summary || null);
     } catch (err) {
       console.error(err);
     }
   };
 
+  // Dompet diidentifikasi server dari sesi login; parameter identitas akun hanya untuk kompatibilitas
+  const fetchWallet = async () => {
+    if (!isAuthenticated) return;
+    try {
+      setLoading(true);
+      const params = new URLSearchParams({
+        role: currentRole || '',
+        name: currentUser?.name || '',
+        identifier: currentUser?.username || ''
+      });
+      const res = await fetch(`/api/wallet/my-wallet?${params.toString()}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.wallet) {
+        setWallet(null);
+        setTransactions([]);
+        setWalletError(handleApiFailure(res, data, 'Dompet digital belum aktif untuk akun ini. Hubungi Tata Usaha sekolah.'));
+      } else {
+        setWallet(data.wallet);
+        setWalletError('');
+        fetchTransactions(data.wallet.id);
+      }
+      if (isStaff) {
+        fetchAllWallets();
+      }
+    } catch (err) {
+      console.error(err);
+      setWalletError('Dompet tidak dapat dimuat karena server tidak terjangkau.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
+    if (!isAuthenticated) {
+      // Tamu: tampilkan ajakan login tanpa memanggil API privat (akan 401)
+      setNeedsLogin(true);
+      setLoading(false);
+      setWallet(null);
+      setTransactions([]);
+      setAllWallets([]);
+      setWalletSummary(null);
+      return;
+    }
+    setNeedsLogin(false);
     fetchWallet();
-  }, [currentRole, currentUser]);
+  }, [isAuthenticated, currentRole, currentUser]);
+
+  const selectedTopupAmount = customAmount ? Number(customAmount) : topupAmount;
+
+  const openTopupModal = () => {
+    if (!wallet) return showToast(walletError || 'Dompet belum aktif, top-up belum dapat dilakukan.', 'error');
+    setTopupStep(1);
+    setShowTopupModal(true);
+  };
+
+  const goToPaymentStep = () => {
+    if (!selectedTopupAmount || selectedTopupAmount < 10000) {
+      return showToast('Minimal top-up adalah Rp 10.000', 'error');
+    }
+    if (topupMethod === 'cash') {
+      setCashBookingCode(`KSR-TOPUP-${Math.floor(1000 + Math.random() * 9000)}`);
+    }
+    setTopupStep(2);
+  };
 
   const handleTopupSubmit = async () => {
-    const finalAmount = customAmount ? Number(customAmount) : topupAmount;
+    if (!wallet) return showToast(walletError || 'Dompet belum aktif, tidak dapat top-up.', 'error');
+    const finalAmount = selectedTopupAmount;
     if (!finalAmount || finalAmount < 10000) {
       return showToast('Minimal top-up adalah Rp 10.000', 'error');
     }
+
+    let referenceNumber;
+    if (topupMethod === 'va') referenceNumber = `VA-${selectedBank}-${Math.floor(100000 + Math.random() * 900000)}`;
+    if (topupMethod === 'cash' && cashBookingCode) referenceNumber = cashBookingCode;
 
     setIsProcessing(true);
     try {
@@ -119,22 +185,23 @@ export default function WalletTopupView() {
           wallet_id: wallet.id,
           amount: finalAmount,
           method: topupMethod,
-          reference_number: topupMethod === 'va' ? `VA-${selectedBank}-${Math.floor(100000 + Math.random() * 900000)}` : undefined
+          reference_number: referenceNumber
         })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        setWallet(data.wallet);
-        fetchTransactions(data.wallet.id);
-        setShowTopupModal(false);
-        setTopupStep(1);
-        setCustomAmount('');
-      } else {
-        showToast(data.message || 'Gagal top-up', 'error');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal memproses top-up'));
       }
+      showToast(data.message || 'Top-up berhasil', 'success');
+      const updatedWallet = data.wallet || wallet;
+      setWallet(updatedWallet);
+      fetchTransactions(updatedWallet.id);
+      if (isStaff) fetchAllWallets();
+      setShowTopupModal(false);
+      setTopupStep(1);
+      setCustomAmount('');
     } catch (err) {
-      showToast('Gagal memproses top-up: ' + err.message, 'error');
+      showToast(err.message || 'Gagal memproses top-up', 'error');
     } finally {
       setIsProcessing(false);
     }
@@ -142,10 +209,15 @@ export default function WalletTopupView() {
 
   const handleTransferSubmit = async (e) => {
     e.preventDefault();
+    if (!wallet) return showToast(walletError || 'Dompet belum aktif, tidak dapat transfer.', 'error');
     const amount = Number(transferAmount);
-    if (!targetCard) return showToast('Masukkan nomor kartu tujuan', 'error');
+    const cardNumber = targetCard.trim();
+    if (!cardNumber) return showToast('Masukkan nomor kartu tujuan', 'error');
+    if (cardNumber.toLowerCase() === String(wallet.card_number || '').toLowerCase()) {
+      return showToast('Tidak dapat transfer ke kartu sendiri', 'error');
+    }
     if (!amount || amount < 5000) return showToast('Minimal transfer Rp 5.000', 'error');
-    if (amount > (wallet?.balance || 0)) return showToast('Saldo Anda tidak mencukupi', 'error');
+    if (amount > (wallet.balance || 0)) return showToast('Saldo Anda tidak mencukupi', 'error');
 
     setIsProcessing(true);
     try {
@@ -154,41 +226,47 @@ export default function WalletTopupView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sender_wallet_id: wallet.id,
-          target_card_number: targetCard.trim(),
+          target_card_number: cardNumber,
           amount: amount,
-          notes: transferNotes
+          notes: transferNotes.trim()
         })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        setWallet(data.wallet);
-        fetchTransactions(data.wallet.id);
-        setShowTransferModal(false);
-        setTargetCard('');
-        setTransferAmount('');
-        setTransferNotes('');
-      } else {
-        showToast(data.message || 'Transfer gagal', 'error');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Transfer gagal'));
       }
+      showToast(data.message || 'Transfer berhasil', 'success');
+      const updatedWallet = data.wallet || wallet;
+      setWallet(updatedWallet);
+      fetchTransactions(updatedWallet.id);
+      if (isStaff) fetchAllWallets();
+      setShowTransferModal(false);
+      setTargetCard('');
+      setTransferAmount('');
+      setTransferNotes('');
     } catch (err) {
-      showToast('Gagal memproses transfer: ' + err.message, 'error');
+      showToast(err.message || 'Gagal memproses transfer', 'error');
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const copyToClipboard = (text, label) => {
-    navigator.clipboard.writeText(text);
-    showToast(`${label} disalin ke clipboard!`, 'info');
+  const copyToClipboard = async (text, label) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast(`${label} disalin ke clipboard!`, 'info');
+    } catch {
+      showToast(`Tidak dapat menyalin otomatis. ${label}: ${text}`, 'info');
+    }
   };
 
   const filteredTransactions = transactions.filter(t => {
+    const type = t.type || '';
     if (filterType === 'all') return true;
-    if (filterType === 'topup') return t.type === 'topup' || t.type === 'transfer_in';
-    if (filterType === 'canteen') return t.type === 'payment_canteen';
-    if (filterType === 'digital') return t.type === 'payment_digital';
-    if (filterType === 'out') return t.type.includes('payment') || t.type === 'transfer_out';
+    if (filterType === 'topup') return type === 'topup' || type === 'transfer_in';
+    if (filterType === 'canteen') return type === 'payment_canteen';
+    if (filterType === 'digital') return type === 'payment_digital';
+    if (filterType === 'out') return type.includes('payment') || type === 'transfer_out';
     return true;
   });
 
@@ -209,19 +287,45 @@ export default function WalletTopupView() {
 
         <div className="flex gap-2 w-full sm:w-auto">
           <button
-            onClick={() => { setTopupStep(1); setShowTopupModal(true); }}
+            onClick={openTopupModal}
             className="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shadow-md shadow-[#002147]/20 flex items-center justify-center gap-2 transition-all cursor-pointer"
           >
             <Plus className="w-4 h-4 text-[#f4a024]" /> Isi Saldo (Top-Up)
           </button>
           <button
-            onClick={() => setShowTransferModal(true)}
-            className="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer"
+            onClick={() => {
+              if (!wallet) return showToast(walletError || 'Dompet belum aktif, transfer belum dapat dilakukan.', 'error');
+              setShowTransferModal(true);
+            }}
+            disabled={!wallet}
+            className="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 text-xs font-bold flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Send className="w-3.5 h-3.5 text-[#002147]" /> Transfer
           </button>
         </div>
       </div>
+
+      {/* Ajakan login untuk tamu / sesi berakhir, atau keterangan dompet belum aktif */}
+      {(needsLogin || (!loading && !wallet && walletError)) && (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-2 text-xs text-amber-900">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <span>
+              {needsLogin
+                ? 'Silakan masuk dengan akun sekolah Anda untuk melihat saldo, riwayat transaksi, dan melakukan top-up.'
+                : walletError}
+            </span>
+          </div>
+          {needsLogin && (
+            <button
+              onClick={openLogin}
+              className="px-4 py-2 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shrink-0 cursor-pointer"
+            >
+              Masuk Sekarang
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Main Grid: Card & Quick Stats */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -277,8 +381,12 @@ export default function WalletTopupView() {
               <div className="text-2xl sm:text-3xl font-black tracking-tight text-white flex items-center gap-1.5">
                 {hideBalance ? (
                   <span>Rp ••••••••</span>
+                ) : loading ? (
+                  <span className="text-base text-slate-300 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Memuat saldo...</span>
+                ) : wallet ? (
+                  <span>Rp {(wallet.balance || 0).toLocaleString('id-ID')}</span>
                 ) : (
-                  <span>Rp {(wallet?.balance || 0).toLocaleString('id-ID')}</span>
+                  <span className="text-base text-slate-300">{needsLogin ? 'Belum masuk' : 'Dompet belum aktif'}</span>
                 )}
               </div>
             </div>
@@ -348,7 +456,7 @@ export default function WalletTopupView() {
               </p>
             </div>
             <button
-              onClick={() => { setTopupStep(1); setShowTopupModal(true); }}
+              onClick={openTopupModal}
               className="mt-3 text-xs font-bold text-[#002147] hover:underline flex items-center gap-1 cursor-pointer"
             >
               Isi Saldo Sekarang &rarr;
@@ -441,8 +549,8 @@ export default function WalletTopupView() {
 
       </div>
 
-      {/* Admin Panel: Monitoring Seluruh Saldo Sekolah */}
-      {currentRole === 'admin' && (
+      {/* Panel Staf/TU: Monitoring Seluruh Saldo Sekolah (GET /api/wallet/all) */}
+      {isStaff && (
         <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-sm space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
             <div>
@@ -500,7 +608,7 @@ export default function WalletTopupView() {
                       </td>
                       <td className="py-3 px-3 text-slate-500 font-mono">{w.holder_identifier || '-'}</td>
                       <td className="py-3 px-3 text-right font-black text-slate-900">
-                        Rp {w.balance.toLocaleString('id-ID')}
+                        Rp {(w.balance || 0).toLocaleString('id-ID')}
                       </td>
                       <td className="py-3 px-3 text-center">
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
@@ -643,7 +751,7 @@ export default function WalletTopupView() {
                 <div className="pt-2">
                   <button
                     type="button"
-                    onClick={() => setTopupStep(2)}
+                    onClick={goToPaymentStep}
                     className="w-full py-2.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shadow-md shadow-[#002147]/20 flex items-center justify-center gap-2 transition-all cursor-pointer"
                   >
                     Lanjutkan Pembayaran Rp {(customAmount ? Number(customAmount) : topupAmount).toLocaleString('id-ID')} &rarr;
@@ -703,7 +811,7 @@ export default function WalletTopupView() {
                     <p className="font-bold flex items-center gap-1.5">
                       <AlertCircle className="w-4 h-4 text-amber-600" /> Kode Booking Kasir:
                     </p>
-                    <p className="font-mono text-base font-black text-[#002147]">KSR-TOPUP-{Math.floor(1000 + Math.random() * 9000)}</p>
+                    <p className="font-mono text-base font-black text-[#002147]">{cashBookingCode || 'KSR-TOPUP-0000'}</p>
                     <p className="text-[11px]">Tunjukkan kode ini kepada kasir kantin atau petugas Tata Usaha sekolah saat menyetorkan uang tunai.</p>
                   </div>
                 )}

@@ -27,13 +27,20 @@ import {
   UploadCloud
 } from 'lucide-react';
 
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // batas /api/upload di server
+const DEFAULT_PRODUCT_IMAGE = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400';
+
 export default function CanteenView() {
-  const { currentUser, currentRole, isStaff, setActiveModule, showToast } = useAuth();
+  const { currentUser, currentRole, isStaff, isAuthenticated, openLogin, setActiveModule, showToast } = useAuth();
   
   // Data states
   const [products, setProducts] = useState([]);
   const [orders, setOrders] = useState([]);
   const [wallet, setWallet] = useState(null);
+  const [walletError, setWalletError] = useState('');
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [accessError, setAccessError] = useState('');
   const [loading, setLoading] = useState(true);
 
   // Filters & Tabs
@@ -68,15 +75,37 @@ export default function CanteenView() {
   const [previewImage, setPreviewImage] = useState('');
   const [isUploading, setIsUploading] = useState(false);
 
-  // Load Data
+  // Terjemahkan respons non-OK menjadi pesan error; 401 = sesi habis (tampilkan ajakan login)
+  const handleApiFailure = (res, data, fallbackMsg) => {
+    if (res.status === 401) {
+      setNeedsLogin(true);
+      return 'Sesi Anda telah berakhir. Silakan masuk kembali untuk memesan.';
+    }
+    if (res.status === 403) {
+      const msg = data?.message || 'Akun Anda tidak memiliki hak akses layanan kantin.';
+      setAccessError(msg);
+      return msg;
+    }
+    return data?.message || fallbackMsg;
+  };
+
+  // Produk bisa dibeli hanya jika tersedia (is_available != 0) dan stok > 0
+  const isProductAvailable = (p) =>
+    Boolean(p) && Number(p.stock) > 0 && p.is_available !== 0 && p.is_available !== false;
+
+  // Load Data (GET /api/canteen/products -> {success, products})
   const loadProducts = async () => {
+    if (!isAuthenticated) return;
     try {
       setLoading(true);
       const res = await fetch('/api/canteen/products');
-      const data = await res.json();
-      if (data.success) {
-        setProducts(data.products || []);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        const msg = handleApiFailure(res, data, 'Gagal memuat daftar produk kantin');
+        if (res.status !== 401 && res.status !== 403) showToast(msg, 'error');
+        return;
       }
+      setProducts(Array.isArray(data.products) ? data.products : []);
     } catch (err) {
       console.error(err);
     } finally {
@@ -84,81 +113,148 @@ export default function CanteenView() {
     }
   };
 
+  // GET /api/canteen/orders -> {success, orders}; staf/pengelola memuat seluruh antrean kasir
   const loadOrders = async () => {
+    if (!isAuthenticated) return;
     try {
-      const url = currentRole === 'admin' 
-        ? '/api/canteen/orders' 
-        : `/api/canteen/orders?buyer_name=${encodeURIComponent(currentUser.name)}`;
+      const url = isStaff
+        ? '/api/canteen/orders'
+        : `/api/canteen/orders?buyer_name=${encodeURIComponent(currentUser.name || '')}`;
       const res = await fetch(url);
-      const data = await res.json();
-      if (data.success) {
-        setOrders(data.orders || []);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        handleApiFailure(res, data, '');
+        return;
       }
+      setOrders(Array.isArray(data.orders) ? data.orders : []);
     } catch (err) {
       console.error(err);
     }
   };
 
+  // GET /api/wallet/my-wallet -> {success, wallet}; dompet diidentifikasi server dari sesi login
+  // (parameter identitas akun hanya untuk kompatibilitas, bukan nama default)
   const loadWallet = async () => {
+    if (!isAuthenticated) return;
     try {
-      const res = await fetch(`/api/wallet/my-wallet?role=${currentRole}&name=${encodeURIComponent(currentUser.name)}&identifier=${currentUser.studentId || '123'}`);
-      const data = await res.json();
-      if (data.success && data.wallet) {
-        setWallet(data.wallet);
+      const params = new URLSearchParams({
+        role: currentRole || '',
+        name: currentUser.name || '',
+        identifier: currentUser.username || ''
+      });
+      const res = await fetch(`/api/wallet/my-wallet?${params.toString()}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.wallet) {
+        setWallet(null);
+        if (res.status === 401) {
+          setNeedsLogin(true);
+          setWalletError('');
+        } else {
+          setWalletError(data.message || 'Dompet digital belum aktif untuk akun ini.');
+        }
+        return;
       }
+      setWallet(data.wallet);
+      setWalletError('');
     } catch (err) {
       console.error(err);
+      setWalletError('Dompet tidak dapat dimuat karena server tidak terjangkau.');
     }
   };
 
   useEffect(() => {
+    if (!isAuthenticated) {
+      // Tamu: jangan panggil API privat (akan 401); tampilkan ajakan login
+      setNeedsLogin(true);
+      setLoading(false);
+      setProducts([]);
+      setOrders([]);
+      setWallet(null);
+      return;
+    }
+    setNeedsLogin(false);
+    setAccessError('');
     loadProducts();
     loadOrders();
     loadWallet();
-  }, [currentRole, currentUser]);
+  }, [isAuthenticated, currentRole, currentUser]);
 
-  // Cart Handlers
+  // Cart Handlers (kuantitas dibatasi stok; produk tidak tersedia tidak bisa ditambahkan)
   const addToCart = (product) => {
+    if (!isProductAvailable(product)) {
+      return showToast(`${product.name} sedang tidak tersedia atau stok habis`, 'error');
+    }
+    const maxQty = Number(product.stock);
+    const existing = cart.find((item) => item.id === product.id);
+    if (existing && existing.quantity >= maxQty) {
+      return showToast(`Stok ${product.name} hanya tersisa ${maxQty}`, 'error');
+    }
     setCart((prev) => {
-      const existing = prev.find((item) => item.id === product.id);
-      if (existing) {
+      const found = prev.find((item) => item.id === product.id);
+      if (found) {
         return prev.map((item) =>
-          item.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
+          item.id === product.id ? { ...item, quantity: Math.min(item.quantity + 1, maxQty) } : item
         );
       }
-      return [...prev, { ...product, quantity: 1 }];
+      return [...prev, {
+        id: product.id,
+        name: product.name,
+        price: Number(product.price) || 0,
+        category: product.category,
+        stock: maxQty,
+        quantity: 1
+      }];
     });
     showToast(`${product.name} dimasukkan ke keranjang`, 'info');
-  };
-
-  const updateQuantity = (productId, delta) => {
-    setCart((prev) =>
-      prev
-        .map((item) => {
-          if (item.id === productId) {
-            const newQty = item.quantity + delta;
-            return newQty > 0 ? { ...item, quantity: newQty } : null;
-          }
-          return item;
-        })
-        .filter(Boolean)
-    );
   };
 
   const removeFromCart = (productId) => {
     setCart((prev) => prev.filter((item) => item.id !== productId));
   };
 
+  const updateQuantity = (productId, delta) => {
+    const item = cart.find((it) => it.id === productId);
+    if (!item) return;
+    const product = products.find((p) => p.id === productId);
+    const maxQty = product ? Number(product.stock) : Number(item.stock) || Infinity;
+    const newQty = item.quantity + delta;
+    if (newQty <= 0) return removeFromCart(productId);
+    if (newQty > maxQty) {
+      return showToast(`Stok ${item.name} hanya tersisa ${maxQty}`, 'error');
+    }
+    setCart((prev) => prev.map((it) => (it.id === productId ? { ...it, quantity: newQty } : it)));
+  };
+
   const cartTotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const cartItemCount = cart.reduce((sum, item) => sum + item.quantity, 0);
   const hasDigitalInCart = cart.some((item) => item.category === 'digital');
 
-  // Checkout Handler
+  // Produk digital tidak bisa dibayar tunai; kembalikan pilihan ke dompet
+  useEffect(() => {
+    if (hasDigitalInCart && paymentMethod === 'cash') setPaymentMethod('wallet');
+  }, [hasDigitalInCart, paymentMethod]);
+
+  // Checkout Handler (POST /api/canteen/order -> {success, message, order, new_balance})
   const handleCheckout = async (e) => {
     e.preventDefault();
     if (cart.length === 0) return showToast('Keranjang belanja kosong', 'error');
+    if (!isAuthenticated) {
+      setNeedsLogin(true);
+      return showToast('Silakan masuk terlebih dahulu untuk memesan', 'error');
+    }
 
-    if (hasDigitalInCart && !digitalTarget) {
+    // Validasi ulang terhadap ketersediaan & stok produk terkini
+    for (const item of cart) {
+      const product = products.find((p) => p.id === item.id);
+      if (!product || !isProductAvailable(product)) {
+        return showToast(`${item.name} sudah tidak tersedia. Hapus dari keranjang.`, 'error');
+      }
+      if (item.quantity > Number(product.stock)) {
+        return showToast(`Stok ${item.name} hanya tersisa ${product.stock}. Kurangi jumlah pesanan.`, 'error');
+      }
+    }
+
+    if (hasDigitalInCart && !digitalTarget.trim()) {
       return showToast('Masukkan nomor tujuan / nomor meter listrik untuk produk digital', 'error');
     }
 
@@ -174,36 +270,41 @@ export default function CanteenView() {
         body: JSON.stringify({
           buyer_name: currentUser.name,
           buyer_role: currentRole,
-          buyer_identifier: currentUser.studentId || 'SISWA',
-          items: cart,
+          buyer_identifier: currentUser.username || '',
+          items: cart.map(({ id, name, price, category, quantity }) => ({ id, name, price, category, quantity })),
           payment_method: paymentMethod,
           pickup_time: hasDigitalInCart ? 'Instan (Produk Digital)' : pickupTime,
-          notes: orderNotes,
-          digital_target: digitalTarget
+          notes: orderNotes.trim(),
+          digital_target: hasDigitalInCart ? digitalTarget.trim() : null
         })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        setCompletedOrder(data.order);
-        setCart([]);
-        setShowCartDrawer(false);
-        setOrderNotes('');
-        setDigitalTarget('');
-        loadProducts();
-        loadOrders();
-        loadWallet();
-      } else {
-        showToast(data.message || 'Gagal memproses pesanan', 'error');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal memproses pesanan'));
       }
+      showToast(data.message || 'Pesanan berhasil dibuat', 'success');
+      setCompletedOrder(data.order || null);
+      // Tampilkan saldo baru langsung dari respons server
+      if (data.new_balance !== null && data.new_balance !== undefined) {
+        setWallet((prev) => (prev ? { ...prev, balance: Number(data.new_balance) } : prev));
+      } else if (data.wallet) {
+        setWallet(data.wallet);
+      }
+      setCart([]);
+      setShowCartDrawer(false);
+      setOrderNotes('');
+      setDigitalTarget('');
+      loadProducts();
+      loadOrders();
+      loadWallet();
     } catch (err) {
-      showToast('Gagal memproses pesanan: ' + err.message, 'error');
+      showToast(err.message || 'Gagal memproses pesanan', 'error');
     } finally {
       setIsOrdering(false);
     }
   };
 
-  // Update Order Status (Admin)
+  // Update Order Status (Kasir / Pengelola) - PUT /api/canteen/orders/:id/status {order_status}
   const handleUpdateOrderStatus = async (orderId, newStatus) => {
     try {
       const res = await fetch(`/api/canteen/orders/${orderId}/status`, {
@@ -211,21 +312,24 @@ export default function CanteenView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ order_status: newStatus })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast('Status pesanan berhasil diperbarui', 'success');
-        loadOrders();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal mengubah status pesanan'));
       }
+      showToast(data.message || 'Status pesanan berhasil diperbarui', 'success');
+      loadOrders();
     } catch (err) {
-      showToast('Gagal mengubah status pesanan', 'error');
+      showToast(err.message || 'Gagal mengubah status pesanan', 'error');
     }
   };
 
-  // Product Photo Upload Handler
+  // Product Photo Upload Handler (validasi sesuai /api/upload: JPG/PNG/WEBP, maks 5 MB)
   const handleFileChange = (e) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) return showToast('Pilih file gambar', 'error');
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) return showToast('Format foto harus JPG, PNG, atau WEBP', 'error');
+    if (file.size > MAX_IMAGE_BYTES) return showToast('Ukuran foto maksimal 5 MB', 'error');
     setSelectedFile(file);
     const reader = new FileReader();
     reader.onload = () => setPreviewImage(reader.result);
@@ -234,12 +338,17 @@ export default function CanteenView() {
 
   const handleAddProduct = async (e) => {
     e.preventDefault();
-    if (!newProdName || !newProdPrice) return showToast('Nama dan harga wajib diisi', 'error');
+    const name = newProdName.trim();
+    const price = Number(newProdPrice);
+    const stock = newProdStock === '' ? 50 : Number(newProdStock);
+    if (!name || !newProdPrice) return showToast('Nama dan harga wajib diisi', 'error');
+    if (!Number.isFinite(price) || price <= 0) return showToast('Harga jual harus lebih dari 0', 'error');
+    if (!Number.isFinite(stock) || stock < 0) return showToast('Stok tidak boleh bernilai negatif', 'error');
 
-    let finalImageUrl = newProdImage;
-    if (uploadMode === 'file' && previewImage) {
-      setIsUploading(true);
-      try {
+    setIsUploading(true);
+    try {
+      let finalImageUrl = uploadMode === 'url' ? newProdImage.trim() : '';
+      if (uploadMode === 'file' && previewImage) {
         const upRes = await fetch('/api/upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -248,63 +357,67 @@ export default function CanteenView() {
             filename: selectedFile?.name || 'produk.jpg'
           })
         });
-        const upData = await upRes.json();
-        if (upData.success) {
-          finalImageUrl = upData.url;
+        const upData = await upRes.json().catch(() => ({}));
+        if (!upRes.ok || !upData.success || !upData.url) {
+          throw new Error(handleApiFailure(upRes, upData, 'Gagal mengunggah foto produk'));
         }
-      } catch (err) {
-        setIsUploading(false);
-        return showToast('Gagal mengunggah foto produk', 'error');
+        finalImageUrl = upData.url;
       }
-    }
 
-    try {
       const res = await fetch('/api/canteen/products', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: newProdName,
+          name,
           category: newProdCategory,
-          price: Number(newProdPrice),
-          stock: Number(newProdStock),
-          image_url: finalImageUrl || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400',
-          description: newProdDesc,
-          stand_name: newProdStand,
+          price,
+          stock,
+          image_url: finalImageUrl || DEFAULT_PRODUCT_IMAGE,
+          description: newProdDesc.trim(),
+          stand_name: newProdStand.trim() || 'Kantin Utama Sekolah',
           digital_type: newProdCategory === 'digital' ? (newProdDigitalType || 'voucher') : null
         })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        setShowProductModal(false);
-        setNewProdName('');
-        setNewProdPrice('');
-        setNewProdDesc('');
-        setNewProdImage('');
-        setSelectedFile(null);
-        setPreviewImage('');
-        loadProducts();
-      } else {
-        showToast(data.message || 'Gagal menambah produk', 'error');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal menambah produk'));
       }
+      showToast(data.message || 'Produk berhasil ditambahkan', 'success');
+      setShowProductModal(false);
+      setNewProdName('');
+      setNewProdPrice('');
+      setNewProdDesc('');
+      setNewProdImage('');
+      setNewProdDigitalType('');
+      setSelectedFile(null);
+      setPreviewImage('');
+      loadProducts();
     } catch (err) {
-      showToast('Gagal menambah produk: ' + err.message, 'error');
+      showToast(err.message || 'Gagal menambah produk', 'error');
     } finally {
       setIsUploading(false);
     }
   };
 
-  const copyText = (txt, label) => {
-    navigator.clipboard.writeText(txt);
-    showToast(`${label} disalin ke clipboard!`, 'info');
+  const copyText = async (txt, label) => {
+    try {
+      await navigator.clipboard.writeText(txt);
+      showToast(`${label} disalin ke clipboard!`, 'info');
+    } catch {
+      showToast(`Tidak dapat menyalin otomatis. ${label}: ${txt}`, 'info');
+    }
   };
 
   const filteredProducts = products.filter((p) => {
+    const q = searchQuery.toLowerCase();
     const matchCat = selectedCategory === 'all' || p.category === selectedCategory;
-    const matchSearch = p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (p.description && p.description.toLowerCase().includes(searchQuery.toLowerCase()));
+    const matchSearch = (p.name || '').toLowerCase().includes(q) ||
+      (p.description && p.description.toLowerCase().includes(q));
     return matchCat && matchSearch;
   });
+
+  // Tab "Pesanan Saya": staf memuat seluruh antrean, jadi saring pesanan miliknya sendiri
+  const myOrders = isStaff ? orders.filter((o) => o.buyer_name === currentUser.name) : orders;
 
   return (
     <div className="space-y-6">
@@ -333,7 +446,9 @@ export default function CanteenView() {
             </div>
             <div>
               <p className="text-[10px] text-slate-500 font-semibold">Saldo Dompet Anda:</p>
-              <p className="text-xs font-black text-[#002147]">Rp {(wallet?.balance || 0).toLocaleString('id-ID')}</p>
+              <p className="text-xs font-black text-[#002147]">
+                {wallet ? `Rp ${(wallet.balance || 0).toLocaleString('id-ID')}` : (needsLogin ? 'Belum masuk' : 'Belum aktif')}
+              </p>
             </div>
           </div>
 
@@ -351,6 +466,28 @@ export default function CanteenView() {
           </button>
         </div>
       </div>
+
+      {/* Ajakan login untuk tamu / sesi berakhir, dan keterangan hak akses */}
+      {(needsLogin || accessError) && (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-2 text-xs text-amber-900">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <span>
+              {needsLogin
+                ? 'Silakan masuk dengan akun sekolah Anda untuk melihat menu kantin, memesan, dan membayar dengan dompet digital.'
+                : accessError}
+            </span>
+          </div>
+          {needsLogin && (
+            <button
+              onClick={openLogin}
+              className="px-4 py-2 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shrink-0 cursor-pointer"
+            >
+              Masuk Sekarang
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Main Tabs Navigation */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
@@ -374,7 +511,7 @@ export default function CanteenView() {
                 : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
             }`}
           >
-            <Clock className="w-3.5 h-3.5 text-[#f4a024]" /> Pesanan Saya ({orders.length})
+            <Clock className="w-3.5 h-3.5 text-[#f4a024]" /> Pesanan Saya ({myOrders.length})
           </button>
 
           {isStaff && (
@@ -445,7 +582,9 @@ export default function CanteenView() {
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
             {filteredProducts.map((p) => {
               const inCart = cart.find((it) => it.id === p.id);
-              const isOutOfStock = p.stock <= 0;
+              const isUnavailable = p.is_available === 0 || p.is_available === false;
+              const isOutOfStock = isUnavailable || Number(p.stock) <= 0;
+              const atStockLimit = Boolean(inCart) && inCart.quantity >= Number(p.stock);
               return (
                 <div
                   key={p.id}
@@ -480,7 +619,7 @@ export default function CanteenView() {
                         <span className={`px-2 py-0.5 rounded-full font-bold ${
                           isOutOfStock ? 'bg-rose-600' : 'bg-emerald-600'
                         }`}>
-                          {isOutOfStock ? 'Habis' : `Stok ${p.stock}`}
+                          {isUnavailable ? 'Tidak Tersedia' : isOutOfStock ? 'Habis' : `Stok ${p.stock}`}
                         </span>
                       </div>
                     </div>
@@ -507,7 +646,7 @@ export default function CanteenView() {
 
                     {isOutOfStock ? (
                       <span className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-400 text-xs font-bold">
-                        Habis
+                        {isUnavailable ? 'Tidak Tersedia' : 'Habis'}
                       </span>
                     ) : inCart ? (
                       <div className="flex items-center gap-1.5 bg-slate-100 rounded-xl p-1 border border-slate-200">
@@ -524,7 +663,9 @@ export default function CanteenView() {
                         <button
                           type="button"
                           onClick={() => updateQuantity(p.id, 1)}
-                          className="w-6 h-6 rounded-lg bg-[#002147] hover:bg-[#002e62] text-white font-bold flex items-center justify-center text-xs cursor-pointer shadow-xs"
+                          disabled={atStockLimit}
+                          title={atStockLimit ? `Stok tersisa ${p.stock}` : 'Tambah jumlah'}
+                          className="w-6 h-6 rounded-lg bg-[#002147] hover:bg-[#002e62] text-white font-bold flex items-center justify-center text-xs cursor-pointer shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           <Plus className="w-3 h-3" />
                         </button>
@@ -533,7 +674,8 @@ export default function CanteenView() {
                       <button
                         type="button"
                         onClick={() => addToCart(p)}
-                        className="px-3 py-1.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold flex items-center gap-1.5 transition-all shadow-xs cursor-pointer"
+                        disabled={needsLogin}
+                        className="px-3 py-1.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold flex items-center gap-1.5 transition-all shadow-xs cursor-pointer disabled:opacity-50"
                       >
                         <Plus className="w-3.5 h-3.5 text-[#f4a024]" /> Tambah
                       </button>
@@ -560,18 +702,20 @@ export default function CanteenView() {
         <div className="space-y-4">
           <div className="flex items-center justify-between pb-2 border-b border-slate-100">
             <h3 className="text-base font-bold text-[#002147]">Daftar Pesanan Saya</h3>
-            <span className="text-xs text-slate-500">{orders.length} pesanan tercatat</span>
+            <span className="text-xs text-slate-500">{myOrders.length} pesanan tercatat</span>
           </div>
 
-          {orders.length === 0 ? (
+          {myOrders.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-3xl p-12 text-center text-slate-400 space-y-2">
               <ShoppingBag className="w-12 h-12 mx-auto text-slate-300" />
               <p className="text-sm font-bold text-slate-700">Belum ada pesanan aktif</p>
-              <p className="text-xs text-slate-500">Silakan pilih menu makanan atau produk digital pada tab Menu & Produk.</p>
+              <p className="text-xs text-slate-500">
+                {needsLogin ? 'Masuk terlebih dahulu untuk melihat riwayat pesanan Anda.' : 'Silakan pilih menu makanan atau produk digital pada tab Menu & Produk.'}
+              </p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {orders.map((ord) => (
+              {myOrders.map((ord) => (
                 <div key={ord.id} className="bg-white border border-slate-200 rounded-3xl p-5 shadow-xs space-y-3 flex flex-col justify-between">
                   <div className="space-y-2.5">
                     <div className="flex items-center justify-between">
@@ -849,10 +993,16 @@ export default function CanteenView() {
                             <p className="font-bold text-[#002147] flex items-center gap-1">
                               <Wallet className="w-3.5 h-3.5 text-[#f4a024]" /> Saldo Dompet Sekolah
                             </p>
-                            <p className="text-[10px] text-slate-500">Saldo Anda: Rp {(wallet?.balance || 0).toLocaleString('id-ID')}</p>
+                            <p className="text-[10px] text-slate-500">
+                              {wallet
+                                ? `Saldo Anda: Rp ${(wallet.balance || 0).toLocaleString('id-ID')}`
+                                : (walletError || 'Dompet digital belum aktif untuk akun ini.')}
+                            </p>
                           </div>
                         </div>
-                        {wallet && wallet.balance < cartTotal ? (
+                        {!wallet ? (
+                          <span className="text-[10px] font-bold text-amber-700">Belum Aktif</span>
+                        ) : wallet.balance < cartTotal ? (
                           <span className="text-[10px] font-bold text-rose-600">Saldo Kurang</span>
                         ) : (
                           <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded">Instan 1-Klik</span>
@@ -1048,6 +1198,24 @@ export default function CanteenView() {
                 </div>
               </div>
 
+              {newProdCategory === 'digital' && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">Jenis Produk Digital:</label>
+                  <select
+                    value={newProdDigitalType}
+                    onChange={(e) => setNewProdDigitalType(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2.5 text-xs text-slate-900 focus:outline-none focus:border-[#002147]"
+                  >
+                    <option value="">Pilih jenis (default: voucher)</option>
+                    <option value="pulsa">Pulsa</option>
+                    <option value="kuota">Paket Kuota Internet</option>
+                    <option value="pln">Token Listrik PLN</option>
+                    <option value="voucher">Voucher Digital</option>
+                    <option value="buku_digital">Buku Digital</option>
+                  </select>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">Harga Jual (Rp):</label>
@@ -1107,7 +1275,7 @@ export default function CanteenView() {
                       />
                       <UploadCloud className="w-6 h-6 text-[#002147] mb-1" />
                       <p className="text-xs font-bold text-slate-800">Klik untuk memilih foto produk dari komputer</p>
-                      <p className="text-[10px] text-slate-500">JPG, PNG, WEBP hingga 25 MB</p>
+                      <p className="text-[10px] text-slate-500">JPG, PNG, WEBP hingga 5 MB</p>
                     </label>
                   ) : (
                     <div className="relative rounded-xl overflow-hidden border border-slate-200 h-32">

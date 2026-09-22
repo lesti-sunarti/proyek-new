@@ -33,6 +33,12 @@ Hak akses didefinisikan sekali di `src/config/access.js` dan digunakan oleh Reac
 4. Inventaris/laboratorium, surat-disposisi, dan pusat notifikasi persistensi.
 5. Dashboard analitik per peran serta ekspor laporan.
 
+## Inisialisasi & data demo
+
+`server/db.js` membuat skema (idempoten) dan menjalankan migrasi ringan; `server/seed.js` mengisi data demo hanya untuk tabel yang masih kosong dan dipanggil otomatis saat server start, sehingga instalasi baru langsung siap dicoba tanpa langkah tambahan. Tanggal operasional (presensi, jurnal, transaksi) memakai zona waktu lokal server.
+
+Lapisan DB menormalkan parameter (`undefined` → NULL, boolean → 0/1) dan menyediakan helper `transaction()` untuk operasi tulis multi-langkah.
+
 ## Batasan saat ini
 
 Ini adalah aplikasi demonstrasi lokal satu sekolah. Untuk penerapan produksi diperlukan PostgreSQL, penyimpanan berkas terpisah, HTTPS, backup terjadwal, observability, dan pengelolaan rahasia melalui environment variables.

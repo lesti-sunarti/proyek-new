@@ -4,14 +4,102 @@ import path from 'path';
 import fs from 'fs';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'url';
-import { db, hashSessionToken, initDatabase, verifyPassword } from './db.js';
+import { db, hashSessionToken, initDatabase, transaction, verifyPassword } from './db.js';
+import { seedDatabase } from './seed.js';
 import { roleCanAccess } from '../src/config/access.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ensure db initialized
+// Ensure db initialized, lalu isi data demo untuk tabel yang masih kosong
+// agar aplikasi langsung siap dicoba pada instalasi baru (idempoten).
 initDatabase();
+seedDatabase({ verbose: false });
+
+// ==========================================
+// HELPER UMUM (tanggal lokal, validasi, error DB, profil sesi)
+// ==========================================
+const LATE_CUTOFF = '07:15:00';
+const pad2 = (value) => String(value).padStart(2, '0');
+// Tanggal & jam memakai zona waktu lokal server (bukan UTC) agar presensi
+// pagi hari tidak tercatat pada tanggal sebelumnya.
+function todayStr(date = new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+function timeStr(date = new Date()) {
+  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+function nowStamp(date = new Date()) {
+  return `${todayStr(date)} ${timeStr(date)}`;
+}
+function cleanText(value, max = 500) {
+  return String(value ?? '').trim().slice(0, max);
+}
+function toNumber(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+function isValidDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(new Date(`${value}T00:00:00`).getTime());
+}
+function isStaffRole(role) {
+  return Boolean(role) && !['siswa', 'ortu', 'publik'].includes(role);
+}
+const UNIQUE_LABELS = {
+  'students.nisn': 'NISN', 'students.nis': 'NIS', 'teachers.nip': 'NIP', 'subjects.code': 'kode mata pelajaran',
+  'library_books.isbn': 'ISBN', 'pemilos_voters.voter_id': 'NIS/ID pemilih', 'pemilos_candidates.candidate_number': 'nomor urut paslon',
+  'walikelas_students.nis': 'NIS', 'walikelas_inventory.item_code': 'kode barang', 'walikelas_piket.day_name': 'hari piket',
+  'walikelas_seating.desk_number': 'nomor kursi', 'wallets.card_number': 'nomor kartu', 'users.username': 'username',
+  'staff_accounts.username': 'username', 'career_applications.opportunity_id, career_applications.applicant_name': 'nama pendaftar pada peluang ini',
+  'walikelas_attendance.date, walikelas_attendance.student_id': 'presensi siswa pada tanggal ini',
+  'walikelas_grades.student_id, walikelas_grades.subject_name': 'nilai siswa untuk mata pelajaran ini',
+};
+// Menerjemahkan error constraint SQLite menjadi respons HTTP yang ramah
+// (409 untuk duplikat, 400 untuk data tidak valid) alih-alih 500 generik.
+function dbErrorResponse(err) {
+  const message = String(err?.message || '');
+  const unique = message.match(/UNIQUE constraint failed: (.+)$/i);
+  if (unique) {
+    const key = unique[1].trim();
+    const label = UNIQUE_LABELS[key] || key.split('.').pop();
+    return { status: 409, message: `Data dengan ${label} yang sama sudah terdaftar.` };
+  }
+  if (/FOREIGN KEY constraint failed/i.test(message)) return { status: 400, message: 'Data rujukan (misalnya siswa/kelas) tidak ditemukan.' };
+  if (/CHECK constraint failed|NOT NULL constraint failed/i.test(message)) return { status: 400, message: 'Data yang dikirim tidak valid atau belum lengkap.' };
+  return null;
+}
+function sendError(res, err, prefix = 'Terjadi kesalahan pada server') {
+  const mapped = dbErrorResponse(err);
+  if (mapped) return res.status(mapped.status).json({ success: false, message: `${prefix}: ${mapped.message}` });
+  console.error(`${prefix}:`, err);
+  return res.status(500).json({ success: false, message: `${prefix}: ${err?.message || 'kesalahan tidak diketahui'}` });
+}
+function getLinkedStudent(studentId) {
+  if (!studentId) return null;
+  return db.prepare(`
+    SELECT s.id, s.name, s.nisn, s.nis, s.qr_code, s.class_id, s.parent_name, s.parent_phone, c.name AS class_name
+    FROM students s LEFT JOIN classes c ON c.id = s.class_id
+    WHERE s.id = ?
+  `).get(studentId) || null;
+}
+// Profil lengkap pemilik sesi (nama, jabatan, siswa terkait) untuk kebutuhan
+// dompet, kuitansi, dan pembatasan data per akun.
+function getSessionProfile(auth) {
+  if (!auth) return null;
+  if (auth.accountType === 'staff') {
+    const staff = db.prepare('SELECT id, username, role, name, title, badge FROM staff_accounts WHERE id = ?').get(auth.id);
+    return staff ? { ...staff, accountType: 'staff', student: null } : null;
+  }
+  const user = db.prepare('SELECT id, username, role, name, email, phone, avatar, related_student_id FROM users WHERE id = ?').get(auth.id);
+  return user ? { ...user, accountType: 'user', student: getLinkedStudent(user.related_student_id) } : null;
+}
+function withLateFlag(rows) {
+  return rows.map((row) => ({
+    ...row,
+    is_late: row.user_type === 'siswa' && row.type === 'masuk' && row.status === 'hadir' && String(row.time || '') > LATE_CUTOFF ? 1 : 0,
+  }));
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -80,7 +168,8 @@ const routeModules = [
   ['/api/feedback', 'feedback'], ['/api/uks', 'uks'], ['/api/wallet', 'topup'], ['/api/canteen', 'kantin'],
   ['/api/pemilos', 'pemilos'], ['/api/walikelas', 'walikelas'], ['/api/system/audit-log', 'audit'],
   ['/api/blogs', 'broadcast'], ['/api/agenda', 'broadcast'], ['/api/broadcasts', 'broadcast'],
-  ['/api/ppdb', 'ppdb_admin'], ['/api/support', 'support_admin'],
+  ['/api/gallery', 'broadcast'], ['/api/alumni', 'broadcast'], ['/api/careers', 'career'],
+  ['/api/ortu', 'ortu_dashboard'], ['/api/ppdb', 'ppdb_admin'], ['/api/support', 'support_admin'],
 ];
 
 function moduleForPath(pathname) {
@@ -127,6 +216,12 @@ const publicPemilosDir = path.resolve(__dirname, '../public/pemilos');
 if (fs.existsSync(publicPemilosDir)) {
   app.use('/pemilos', express.static(publicPemilosDir));
 }
+
+// Health check dipasang sebelum gerbang akses agar indikator koneksi di
+// antarmuka berfungsi baik pada mode pengembangan (Vite proxy) maupun produksi.
+app.get('/api/health', (req, res) => {
+  res.json({ success: true, status: 'ok', serverTime: new Date().toISOString() });
+});
 
 // Universal File Upload Endpoint (Base64 -> Local File in uploads/)
 app.post('/api/upload', requireAuth, (req, res) => {
@@ -231,14 +326,15 @@ app.post('/api/auth/login', loginRateLimit, (req, res) => {
   loginAttempts.delete(req.loginAttemptKey);
   setSessionCookie(res, session.token);
   const { password_hash, ...safeUser } = user;
+  safeUser.student = getLinkedStudent(user.related_student_id);
   writeAuditLog({ actor: safeUser, action: 'login', resource: 'authentication', req });
   res.json({ success: true, user: safeUser, expiresAt: session.expiresAt });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
-  const table = req.auth.accountType === 'staff' ? 'staff_accounts' : 'users';
-  const user = db.prepare(`SELECT id, username, role, name${table === 'staff_accounts' ? ', title, badge' : ', email, phone, avatar, related_student_id'} FROM ${table} WHERE id = ?`).get(req.auth.id);
-  if (!user) return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: 'Sesi tidak lagi valid.' });
+  const profile = getSessionProfile(req.auth);
+  if (!profile) return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: 'Sesi tidak lagi valid.' });
+  const { accountType, ...user } = profile;
   res.json({ success: true, user });
 });
 
@@ -277,13 +373,20 @@ app.get('/api/public/stats', (req, res) => {
 // 3. ABSENSI DUAL MODE & NOTIFIKASI ORTU (MODUL 2)
 // ==========================================
 app.get('/api/attendance/today', (req, res) => {
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayStr();
   const logs = db.prepare('SELECT * FROM attendance WHERE date = ? ORDER BY id DESC').all(today);
-  res.json(logs);
+  res.json(withLateFlag(logs));
 });
 
 app.get('/api/attendance/history', (req, res) => {
-  const { person_id, user_type, limit = 50 } = req.query;
+  let { person_id, user_type, limit = 50 } = req.query;
+  if (!isStaffRole(req.auth.role)) {
+    // Siswa/orang tua hanya boleh melihat riwayat siswa yang terkait dengan akunnya.
+    const profile = getSessionProfile(req.auth);
+    if (!profile?.student) return res.json([]);
+    person_id = profile.student.id;
+    user_type = 'siswa';
+  }
   let query = 'SELECT * FROM attendance';
   const params = [];
   if (person_id && user_type) {
@@ -291,20 +394,20 @@ app.get('/api/attendance/history', (req, res) => {
     params.push(Number(person_id), user_type);
   }
   query += ' ORDER BY id DESC LIMIT ?';
-  params.push(Number(limit));
+  params.push(Math.min(Math.max(toNumber(limit, 50), 1), 500));
   const logs = db.prepare(query).all(...params);
-  res.json(logs);
+  res.json(withLateFlag(logs));
 });
 
 app.get('/api/attendance/intelligence', (req, res) => {
   const requestedDays = Number.parseInt(req.query.days, 10) || 30;
   const days = Math.min(Math.max(requestedDays, 7), 90);
   const now = new Date();
-  const today = now.toISOString().split('T')[0];
+  const today = todayStr(now);
   const start = new Date(now);
   start.setDate(start.getDate() - (days - 1));
-  const startDate = start.toISOString().split('T')[0];
-  const lateCutoff = '07:15:00';
+  const startDate = todayStr(start);
+  const lateCutoff = LATE_CUTOFF;
 
   const students = db.prepare(`
     SELECT s.id, s.name, s.status, c.name AS class_name
@@ -373,47 +476,67 @@ app.get('/api/attendance/intelligence', (req, res) => {
 });
 
 app.post('/api/attendance/scan', (req, res) => {
-  const { qr_string, type = 'masuk', method = 'self_scan', subject_name = null, notes = '' } = req.body;
-  if (!qr_string) {
+  const qrString = cleanText(req.body?.qr_string, 120);
+  const type = ['masuk', 'pulang', 'mapel'].includes(req.body?.type) ? req.body.type : 'masuk';
+  const method = ['self_scan', 'kiosk_card', 'manual'].includes(req.body?.method) ? req.body.method : 'self_scan';
+  const subjectName = cleanText(req.body?.subject_name, 120) || null;
+  const notes = cleanText(req.body?.notes, 300);
+  if (!qrString) {
     return res.status(400).json({ success: false, message: 'QR Code tidak boleh kosong' });
   }
-
-  let cleanId = qr_string.replace('SISWA-', '').replace('GURU-', '').trim();
-
-  let student = db.prepare('SELECT * FROM students WHERE nisn = ? OR nis = ? OR qr_code = ?').get(cleanId, cleanId, qr_string);
-  let teacher = null;
-  if (!student) {
-    teacher = db.prepare('SELECT * FROM teachers WHERE nip = ? OR nuptk = ?').get(cleanId, cleanId);
+  if (type === 'mapel' && !subjectName) {
+    return res.status(400).json({ success: false, message: 'Presensi mata pelajaran memerlukan nama mata pelajaran.' });
   }
+
+  const cleanId = qrString.replace(/^SISWA-/i, '').replace(/^GURU-/i, '').trim();
+
+  const student = db.prepare('SELECT * FROM students WHERE nisn = ? OR nis = ? OR qr_code = ?').get(cleanId, cleanId, qrString);
+  const teacher = student ? null : db.prepare('SELECT * FROM teachers WHERE nip = ? OR nuptk = ?').get(cleanId, cleanId);
 
   if (!student && !teacher) {
     return res.status(404).json({ success: false, message: 'Identitas kartu atau QR Code tidak terdaftar di sistem sekolah.' });
   }
 
   const now = new Date();
-  const dateStr = now.toISOString().split('T')[0];
-  const timeStr = now.toTimeString().split(' ')[0];
+  const dateStr = todayStr(now);
+  const clockTime = timeStr(now);
 
   const user_type = student ? 'siswa' : 'guru';
   const person_id = student ? student.id : teacher.id;
   const person_name = student ? student.name : teacher.name;
   const person_identifier = (student ? student.nisn : (teacher.nip || teacher.nuptk || `GURU-${teacher.id}`)) || 'UNKNOWN';
-  const isLate = user_type === 'siswa' && type === 'masuk' && timeStr > '07:15:00';
 
-  const stmt = db.prepare(`
+  // Cegah pencatatan ganda: satu orang cukup satu kali scan masuk/pulang per hari.
+  if (type !== 'mapel') {
+    const existing = db.prepare(`
+      SELECT * FROM attendance WHERE user_type = ? AND person_id = ? AND date = ? AND type = ? ORDER BY id ASC LIMIT 1
+    `).get(user_type, person_id, dateStr, type);
+    if (existing) {
+      const [record] = withLateFlag([existing]);
+      return res.json({
+        success: true,
+        already_recorded: true,
+        message: `Presensi ${type.toUpperCase()} atas nama ${person_name} sudah tercatat hari ini pada pukul ${String(existing.time).slice(0, 5)}.`,
+        record: { ...record, parent_phone: student?.parent_phone || null, is_late: Boolean(record.is_late) },
+      });
+    }
+  }
+
+  const isLate = user_type === 'siswa' && type === 'masuk' && clockTime > LATE_CUTOFF;
+  db.prepare(`
     INSERT INTO attendance (user_type, person_id, person_name, person_identifier, date, time, type, subject_name, status, method, notes)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'hadir', ?, ?)
-  `);
-  stmt.run(user_type, person_id, person_name, person_identifier, dateStr, timeStr, type, subject_name, method, notes || `Absen ${type} via ${method}`);
+  `).run(user_type, person_id, person_name, person_identifier, dateStr, clockTime, type, subjectName, method, notes || `Absen ${type} via ${method}`);
 
   res.json({
     success: true,
-    message: `Presensi ${type.toUpperCase()} atas nama ${person_name} (${user_type.toUpperCase()}) berhasil dicatat${isLate ? ' dan perlu diverifikasi sebagai scan setelah batas waktu.' : '!'} `,
+    message: `Presensi ${type.toUpperCase()} atas nama ${person_name} (${user_type.toUpperCase()}) berhasil dicatat${isLate ? ' dan perlu diverifikasi sebagai scan setelah batas waktu.' : '!'}`,
     record: {
       person_name,
       user_type,
-      time: timeStr,
+      time: clockTime,
       date: dateStr,
+      subject_name: subjectName,
       parent_phone: student?.parent_phone || null,
       is_late: isLate
     }
@@ -441,31 +564,65 @@ app.get('/api/cbt/exams/:id', (req, res) => {
 });
 
 app.post('/api/cbt/exams', (req, res) => {
-  const { title, subject_name, class_name, duration_minutes, passing_score = 75, max_violations = 3, questions = [] } = req.body;
-  const insertExam = db.prepare(`
-    INSERT INTO cbt_exams (title, subject_name, class_name, duration_minutes, total_questions, passing_score, is_active, max_violations)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-  `);
-  const result = insertExam.run(title, subject_name, class_name, duration_minutes, questions.length, passing_score, max_violations);
-  const examId = result.lastInsertRowid;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat membuat paket ujian.' });
+  const title = cleanText(req.body?.title, 180);
+  const subjectName = cleanText(req.body?.subject_name, 120);
+  const className = cleanText(req.body?.class_name, 80);
+  const duration = toNumber(req.body?.duration_minutes, 0);
+  const passingScore = Math.min(Math.max(toNumber(req.body?.passing_score, 75), 0), 100);
+  const maxViolations = Math.max(toNumber(req.body?.max_violations, 3), 1);
+  const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
 
-  const insertQ = db.prepare(`
-    INSERT INTO cbt_questions (exam_id, question_text, question_type, option_a, option_b, option_c, option_d, option_e, correct_option, points)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  for (const q of questions) {
-    insertQ.run(examId, q.question_text, q.question_type || 'pg', q.option_a || null, q.option_b || null, q.option_c || null, q.option_d || null, q.option_e || null, q.correct_option || null, q.points || 10);
+  if (!title || !subjectName || !className) return res.status(400).json({ success: false, message: 'Judul, mata pelajaran, dan kelas ujian wajib diisi.' });
+  if (duration < 1 || duration > 600) return res.status(400).json({ success: false, message: 'Durasi ujian harus antara 1 sampai 600 menit.' });
+  if (!questions.length) return res.status(400).json({ success: false, message: 'Paket ujian minimal memiliki satu soal.' });
+
+  const preparedQuestions = [];
+  for (const [index, q] of questions.entries()) {
+    const questionText = cleanText(q?.question_text, 4000);
+    const questionType = q?.question_type === 'essay' ? 'essay' : 'pg';
+    const options = ['a', 'b', 'c', 'd', 'e'].map((key) => cleanText(q?.[`option_${key}`], 1000) || null);
+    const correctOption = questionType === 'pg' ? cleanText(q?.correct_option, 1).toUpperCase() : null;
+    if (!questionText) return res.status(400).json({ success: false, message: `Teks soal nomor ${index + 1} tidak boleh kosong.` });
+    if (questionType === 'pg') {
+      const filledOptions = options.filter(Boolean).length;
+      const optionIndex = ['A', 'B', 'C', 'D', 'E'].indexOf(correctOption);
+      if (filledOptions < 2) return res.status(400).json({ success: false, message: `Soal pilihan ganda nomor ${index + 1} minimal memiliki dua opsi jawaban.` });
+      if (optionIndex === -1 || !options[optionIndex]) return res.status(400).json({ success: false, message: `Kunci jawaban soal nomor ${index + 1} harus menunjuk opsi yang terisi.` });
+    }
+    preparedQuestions.push({ questionText, questionType, options, correctOption, points: Math.max(toNumber(q?.points, 10), 1) });
   }
 
-  res.json({ success: true, examId, message: 'Paket Ujian CBT berhasil dibuat!' });
+  try {
+    const examId = transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO cbt_exams (title, subject_name, class_name, duration_minutes, total_questions, passing_score, is_active, max_violations)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+      `).run(title, subjectName, className, duration, preparedQuestions.length, passingScore, maxViolations);
+      const newExamId = result.lastInsertRowid;
+      const insertQ = db.prepare(`
+        INSERT INTO cbt_questions (exam_id, question_text, question_type, option_a, option_b, option_c, option_d, option_e, correct_option, points)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      preparedQuestions.forEach((q) => insertQ.run(newExamId, q.questionText, q.questionType, ...q.options, q.correctOption, q.points));
+      return newExamId;
+    });
+    res.status(201).json({ success: true, examId, message: 'Paket Ujian CBT berhasil dibuat!' });
+  } catch (err) {
+    sendError(res, err, 'Gagal membuat paket ujian');
+  }
 });
 
 // Catat Pelanggaran Anti-Nyontek
 app.post('/api/cbt/exams/:id/violation', (req, res) => {
-  const { student_id, student_name, violation_type, timestamp } = req.body;
-  const examId = req.params.id;
+  const { violation_type, timestamp } = req.body || {};
+  const examId = Number(req.params.id);
+  const student_id = toNumber(req.body?.student_id);
+  const student_name = cleanText(req.body?.student_name, 120) || 'Peserta';
+  if (!student_id) return res.status(400).json({ success: false, message: 'Identitas peserta ujian tidak valid.' });
+  if (!db.prepare('SELECT id FROM cbt_exams WHERE id = ?').get(examId)) return res.status(404).json({ success: false, message: 'Ujian tidak ditemukan' });
 
-  let attempt = db.prepare('SELECT * FROM cbt_attempts WHERE exam_id = ? AND student_id = ?').get(examId, Number(student_id));
+  let attempt = db.prepare('SELECT * FROM cbt_attempts WHERE exam_id = ? AND student_id = ?').get(examId, student_id);
   const nowStr = new Date().toISOString();
 
   let violations = [];
@@ -510,8 +667,27 @@ app.post('/api/cbt/exams/:id/violation', (req, res) => {
 
 // Submit Ujian & Hitung Nilai Otomatis
 app.post('/api/cbt/exams/:id/submit', (req, res) => {
-  const { student_id, student_name, answers = {}, force_submitted = false } = req.body;
-  const examId = req.params.id;
+  const { force_submitted = false } = req.body || {};
+  const answers = req.body?.answers && typeof req.body.answers === 'object' ? req.body.answers : {};
+  const examId = Number(req.params.id);
+  const student_id = toNumber(req.body?.student_id);
+  const student_name = cleanText(req.body?.student_name, 120) || 'Peserta';
+  if (!student_id) return res.status(400).json({ success: false, message: 'Identitas peserta ujian tidak valid.' });
+  const exam = db.prepare('SELECT * FROM cbt_exams WHERE id = ?').get(examId);
+  if (!exam) return res.status(404).json({ success: false, message: 'Ujian tidak ditemukan' });
+
+  // Jawaban yang sudah dikirim tidak boleh ditimpa (mencegah pengiriman ulang).
+  const previous = db.prepare('SELECT * FROM cbt_attempts WHERE exam_id = ? AND student_id = ?').get(examId, student_id);
+  if (previous && previous.status !== 'ongoing') {
+    return res.json({
+      success: true,
+      already_submitted: true,
+      score: previous.score,
+      status: previous.status,
+      passed: Number(previous.score) >= Number(exam.passing_score || 75),
+      message: 'Jawaban ujian ini sudah pernah dikirim; nilai yang tersimpan tetap dipakai.'
+    });
+  }
 
   const questions = db.prepare('SELECT * FROM cbt_questions WHERE exam_id = ?').all(examId);
   let totalScore = 0;
@@ -554,6 +730,7 @@ app.post('/api/cbt/exams/:id/submit', (req, res) => {
     success: true,
     score: finalScore,
     status,
+    passed: finalScore >= Number(exam.passing_score || 75),
     message: force_submitted
       ? 'Ujian telah disubmit secara otomatis akibat pelanggaran keamanan!'
       : 'Ujian berhasil diselesaikan dan dinilai secara otomatis.'
@@ -574,13 +751,20 @@ app.get('/api/academic/classes', (req, res) => {
 });
 
 app.post('/api/academic/classes', (req, res) => {
-  const { name, grade, major, academic_year, homeroom_teacher_name } = req.body;
-  const stmt = db.prepare(`
+  const name = cleanText(req.body?.name, 60);
+  const grade = cleanText(req.body?.grade, 10);
+  const major = cleanText(req.body?.major, 60) || null;
+  const academicYear = cleanText(req.body?.academic_year, 20);
+  const homeroom = cleanText(req.body?.homeroom_teacher_name, 120) || null;
+  if (!name || !grade || !academicYear) return res.status(400).json({ success: false, message: 'Nama kelas, tingkat, dan tahun ajaran wajib diisi.' });
+  const duplicate = db.prepare('SELECT id FROM classes WHERE lower(name) = lower(?) AND academic_year = ?').get(name, academicYear);
+  if (duplicate) return res.status(409).json({ success: false, message: `Kelas ${name} untuk tahun ajaran ${academicYear} sudah ada.` });
+  const result = db.prepare(`
     INSERT INTO classes (name, grade, major, academic_year, homeroom_teacher_name)
     VALUES (?, ?, ?, ?, ?)
-  `);
-  stmt.run(name, grade, major, academic_year, homeroom_teacher_name);
-  res.json({ success: true, message: 'Kelas berhasil ditambahkan' });
+  `).run(name, grade, major, academicYear, homeroom);
+  const created = db.prepare('SELECT * FROM classes WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, class: created, message: 'Kelas berhasil ditambahkan' });
 });
 
 app.get('/api/academic/subjects', (req, res) => {
@@ -680,18 +864,33 @@ app.post('/api/academic/schedules', (req, res) => {
 // 6. KARTU SPP & PEMBAYARAN DIGITAL (MODUL 5)
 // ==========================================
 app.get(['/api/spp/bills/:studentId', '/api/spp/bills/student/:studentId'], (req, res) => {
-  const sppBills = db.prepare('SELECT * FROM spp_bills WHERE student_id = ? ORDER BY id ASC').all(req.params.studentId);
-  const otherBills = db.prepare('SELECT * FROM other_bills WHERE student_id = ?').all(req.params.studentId);
-  res.json({ sppBills, otherBills });
+  let studentId = toNumber(req.params.studentId);
+  if (!isStaffRole(req.auth.role)) {
+    // Siswa/orang tua hanya dapat melihat tagihan siswa yang terkait dengan akunnya.
+    const profile = getSessionProfile(req.auth);
+    if (!profile?.student) return res.status(403).json({ success: false, message: 'Akun Anda belum terhubung dengan data siswa.' });
+    studentId = profile.student.id;
+  }
+  const student = getLinkedStudent(studentId);
+  if (!student) return res.status(404).json({ success: false, message: 'Siswa tidak ditemukan.' });
+  const sppBills = db.prepare('SELECT * FROM spp_bills WHERE student_id = ? ORDER BY id ASC').all(studentId);
+  const otherBills = db.prepare('SELECT * FROM other_bills WHERE student_id = ?').all(studentId);
+  res.json({ student, sppBills, otherBills });
 });
 
 app.post('/api/spp/pay/:billId', (req, res) => {
-  const { payment_method = 'QRIS Instant Payment' } = req.body;
-  const now = new Date().toISOString().split('T')[0];
+  const payment_method = cleanText(req.body?.payment_method, 60) || 'QRIS Instant Payment';
+  const now = todayStr();
 
   const currentBill = db.prepare('SELECT * FROM spp_bills WHERE id = ?').get(req.params.billId);
   if (!currentBill) {
     return res.status(404).json({ success: false, message: 'Tagihan tidak ditemukan' });
+  }
+  if (!isStaffRole(req.auth.role)) {
+    const profile = getSessionProfile(req.auth);
+    if (!profile?.student || profile.student.id !== currentBill.student_id) {
+      return res.status(403).json({ success: false, message: 'Tagihan ini bukan milik siswa yang terkait dengan akun Anda.' });
+    }
   }
 
   // Idempotency check: jika sudah lunas, jangan duplikasi transaksi kas
@@ -705,22 +904,25 @@ app.post('/api/spp/pay/:billId', (req, res) => {
 
   const receipt = `KW-SPP-${Date.now().toString().slice(-6)}`;
   
-  db.prepare(`
-    UPDATE spp_bills
-    SET status = 'lunas', payment_date = ?, payment_method = ?, receipt_number = ?
-    WHERE id = ?
-  `).run(now, payment_method, receipt, req.params.billId);
+  transaction(() => {
+    db.prepare(`
+      UPDATE spp_bills
+      SET status = 'lunas', payment_date = ?, payment_method = ?, receipt_number = ?
+      WHERE id = ?
+    `).run(now, payment_method, receipt, currentBill.id);
 
-  // Catat otomatis di kas masuk keuangan sekolah
-  db.prepare(`
-    INSERT INTO finance_transactions (type, category, amount, date, description, source_or_recipient)
-    VALUES ('masuk', 'SPP Siswa', ?, ?, ?, ?)
-  `).run(currentBill.amount, now, `Pembayaran SPP ${currentBill.month} ${currentBill.year} (${receipt})`, 'Siswa & Wali Murid');
+    // Catat otomatis di kas masuk keuangan sekolah
+    db.prepare(`
+      INSERT INTO finance_transactions (type, category, amount, date, description, source_or_recipient)
+      VALUES ('masuk', 'SPP Siswa', ?, ?, ?, ?)
+    `).run(currentBill.amount, now, `Pembayaran SPP ${currentBill.month} ${currentBill.year} (${receipt})`, 'Siswa & Wali Murid');
+  });
 
-  res.json({ success: true, message: 'Pembayaran berhasil dikonfirmasi dan dicatat!', receipt_number: receipt });
+  res.json({ success: true, message: 'Pembayaran berhasil dikonfirmasi dan dicatat!', receipt_number: receipt, payment_date: now, payment_method });
 });
 
 app.get('/api/spp/all', (req, res) => {
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Rekap SPP seluruh siswa hanya untuk staf sekolah.' });
   const bills = db.prepare(`
     SELECT b.*, s.name as student_name, s.nisn, c.name as class_name
     FROM spp_bills b
@@ -805,22 +1007,35 @@ app.get('/api/master/students/:id/timeline', (req, res) => {
 });
 
 app.post('/api/master/students', (req, res) => {
-  const { nisn, nis, name, gender, birth_place, birth_date, address, parent_name, parent_phone, class_id } = req.body;
-  const qrCode = `SISWA-${nisn}`;
-  const stmt = db.prepare(`
-    INSERT INTO students (nisn, nis, name, gender, birth_place, birth_date, address, parent_name, parent_phone, class_id, status, qr_code)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)
-  `);
-  stmt.run(nisn, nis, name, gender, birth_place, birth_date, address, parent_name, parent_phone, class_id, qrCode);
+  const nisn = cleanText(req.body?.nisn, 20);
+  const nis = cleanText(req.body?.nis, 20);
+  const name = cleanText(req.body?.name, 120);
+  const gender = cleanText(req.body?.gender, 20) || 'Laki-laki';
+  const classId = toNumber(req.body?.class_id);
+  if (!nisn || !nis || !name) return res.status(400).json({ success: false, message: 'NISN, NIS, dan nama siswa wajib diisi.' });
+  if (!/^\d{6,20}$/.test(nisn)) return res.status(400).json({ success: false, message: 'NISN harus berupa angka (6-20 digit).' });
+  if (classId && !db.prepare('SELECT id FROM classes WHERE id = ?').get(classId)) return res.status(400).json({ success: false, message: 'Kelas yang dipilih tidak ditemukan.' });
 
-  const newStudent = db.prepare('SELECT id FROM students WHERE nisn = ?').get(nisn);
-  if (newStudent) {
-    const months = ['Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember', 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni'];
-    const insertSpp = db.prepare('INSERT INTO spp_bills (student_id, month, year, amount, status) VALUES (?, ?, 2025, 350000, "belum")');
-    months.forEach(m => insertSpp.run(newStudent.id, m));
+  try {
+    const studentId = transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO students (nisn, nis, name, gender, birth_place, birth_date, address, parent_name, parent_phone, class_id, status, qr_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aktif', ?)
+      `).run(nisn, nis, name, gender, cleanText(req.body?.birth_place, 80) || null, cleanText(req.body?.birth_date, 20) || null, cleanText(req.body?.address, 300) || null, cleanText(req.body?.parent_name, 120) || null, cleanText(req.body?.parent_phone, 30) || null, classId, `SISWA-${nisn}`);
+      const newId = result.lastInsertRowid;
+      // Kartu SPP untuk tahun ajaran berjalan: Juli–Desember tahun ini, Januari–Juni tahun berikutnya.
+      const now = new Date();
+      const startYear = now.getMonth() >= 6 ? now.getFullYear() : now.getFullYear() - 1;
+      const insertSpp = db.prepare("INSERT INTO spp_bills (student_id, month, year, amount, status) VALUES (?, ?, ?, 350000, 'belum')");
+      ['Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'].forEach((month) => insertSpp.run(newId, month, startYear));
+      ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni'].forEach((month) => insertSpp.run(newId, month, startYear + 1));
+      return newId;
+    });
+    const student = db.prepare('SELECT s.*, c.name as class_name FROM students s LEFT JOIN classes c ON s.class_id = c.id WHERE s.id = ?').get(studentId);
+    res.status(201).json({ success: true, student, message: 'Data Siswa Buku Induk berhasil ditambahkan beserta 12 bulan kartu SPP' });
+  } catch (err) {
+    sendError(res, err, 'Gagal menambahkan siswa');
   }
-
-  res.json({ success: true, message: 'Data Siswa Buku Induk berhasil ditambahkan beserta 12 bulan kartu SPP' });
 });
 
 app.get(['/api/master/teachers', '/api/buku_induk/teachers'], (req, res) => {
@@ -829,13 +1044,19 @@ app.get(['/api/master/teachers', '/api/buku_induk/teachers'], (req, res) => {
 });
 
 app.post('/api/master/teachers', (req, res) => {
-  const { nip, nuptk, name, gender, subject, phone, email, education, position } = req.body;
-  const stmt = db.prepare(`
-    INSERT INTO teachers (nip, nuptk, name, gender, subject, phone, email, education, position, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Aktif')
-  `);
-  stmt.run(nip, nuptk, name, gender, subject, phone, email, education, position);
-  res.json({ success: true, message: 'Data Guru & Staf berhasil ditambahkan' });
+  const name = cleanText(req.body?.name, 120);
+  const gender = cleanText(req.body?.gender, 20) || 'Laki-laki';
+  if (!name) return res.status(400).json({ success: false, message: 'Nama guru/staf wajib diisi.' });
+  try {
+    const result = db.prepare(`
+      INSERT INTO teachers (nip, nuptk, name, gender, subject, phone, email, education, position, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Aktif')
+    `).run(cleanText(req.body?.nip, 30) || null, cleanText(req.body?.nuptk, 30) || null, name, gender, cleanText(req.body?.subject, 120) || null, cleanText(req.body?.phone, 30) || null, cleanText(req.body?.email, 120) || null, cleanText(req.body?.education, 120) || null, cleanText(req.body?.position, 120) || 'Guru Pengajar');
+    const teacher = db.prepare('SELECT * FROM teachers WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json({ success: true, teacher, message: 'Data Guru & Staf berhasil ditambahkan' });
+  } catch (err) {
+    sendError(res, err, 'Gagal menambahkan guru/staf');
+  }
 });
 
 // ==========================================
@@ -857,13 +1078,21 @@ app.get('/api/finance/transactions', (req, res) => {
 });
 
 app.post('/api/finance/transactions', (req, res) => {
-  const { type, category, amount, date, description, source_or_recipient } = req.body;
-  const stmt = db.prepare(`
+  const type = req.body?.type === 'keluar' ? 'keluar' : req.body?.type === 'masuk' ? 'masuk' : null;
+  const category = cleanText(req.body?.category, 80);
+  const amount = toNumber(req.body?.amount, 0);
+  const description = cleanText(req.body?.description, 500);
+  const date = cleanText(req.body?.date, 10) || todayStr();
+  if (!type) return res.status(400).json({ success: false, message: "Jenis transaksi harus 'masuk' atau 'keluar'." });
+  if (!category || !description) return res.status(400).json({ success: false, message: 'Kategori dan keterangan transaksi wajib diisi.' });
+  if (amount <= 0) return res.status(400).json({ success: false, message: 'Nominal transaksi harus lebih dari 0.' });
+  if (!isValidDate(date)) return res.status(400).json({ success: false, message: 'Format tanggal transaksi tidak valid (YYYY-MM-DD).' });
+  const result = db.prepare(`
     INSERT INTO finance_transactions (type, category, amount, date, description, source_or_recipient)
     VALUES (?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(type, category, Number(amount), date || new Date().toISOString().split('T')[0], description, source_or_recipient);
-  res.json({ success: true, message: 'Transaksi kas keuangan berhasil dicatat' });
+  `).run(type, category, Math.round(amount), date, description, cleanText(req.body?.source_or_recipient, 150) || null);
+  const created = db.prepare('SELECT * FROM finance_transactions WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, transaction: created, message: 'Transaksi kas keuangan berhasil dicatat' });
 });
 
 // ==========================================
@@ -875,25 +1104,41 @@ app.get(['/api/payroll', '/api/payroll/list'], (req, res) => {
 });
 
 app.post('/api/payroll/generate', (req, res) => {
-  const { staff_id, month, year, base_salary, allowance = 0, teaching_fee = 0, deductions = 0 } = req.body;
-  const teacher = db.prepare('SELECT * FROM teachers WHERE id = ?').get(staff_id);
-  if (!teacher) return res.status(404).json({ message: 'Guru/Staf tidak ditemukan' });
+  const staffId = toNumber(req.body?.staff_id);
+  const month = cleanText(req.body?.month, 20);
+  const year = toNumber(req.body?.year);
+  const baseSalary = toNumber(req.body?.base_salary, 0);
+  const allowance = toNumber(req.body?.allowance, 0);
+  const teachingFee = toNumber(req.body?.teaching_fee, 0);
+  const deductions = toNumber(req.body?.deductions, 0);
+  const teacher = staffId ? db.prepare('SELECT * FROM teachers WHERE id = ?').get(staffId) : null;
+  if (!teacher) return res.status(404).json({ success: false, message: 'Guru/Staf tidak ditemukan' });
+  if (!month || !year) return res.status(400).json({ success: false, message: 'Periode gaji (bulan dan tahun) wajib diisi.' });
+  if (baseSalary <= 0) return res.status(400).json({ success: false, message: 'Gaji pokok harus lebih dari 0.' });
+  if ([allowance, teachingFee, deductions].some((value) => value < 0)) return res.status(400).json({ success: false, message: 'Tunjangan, honor, dan potongan tidak boleh negatif.' });
 
-  const netSalary = Number(base_salary) + Number(allowance) + Number(teaching_fee) - Number(deductions);
-  const now = new Date().toISOString().split('T')[0];
+  const duplicate = db.prepare('SELECT id FROM payrolls WHERE staff_id = ? AND lower(month) = lower(?) AND year = ?').get(staffId, month, year);
+  if (duplicate) return res.status(409).json({ success: false, message: `Slip gaji ${teacher.name} untuk ${month} ${year} sudah pernah diterbitkan.` });
 
-  const stmt = db.prepare(`
-    INSERT INTO payrolls (staff_id, staff_name, staff_role, month, year, base_salary, allowance, teaching_fee, deductions, net_salary, status, paid_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
-  `);
-  stmt.run(staff_id, teacher.name, teacher.position, month, year, Number(base_salary), Number(allowance), Number(teaching_fee), Number(deductions), netSalary, now);
+  const netSalary = Math.round(baseSalary + allowance + teachingFee - deductions);
+  if (netSalary < 0) return res.status(400).json({ success: false, message: 'Potongan melebihi total penghasilan.' });
+  const now = todayStr();
 
-  db.prepare(`
-    INSERT INTO finance_transactions (type, category, amount, date, description, source_or_recipient)
-    VALUES ('keluar', 'Gaji & Honor Guru', ?, ?, ?, ?)
-  `).run(netSalary, now, `Pembayaran Gaji ${teacher.name} (${month} ${year})`, teacher.name);
+  const payrollId = transaction(() => {
+    const result = db.prepare(`
+      INSERT INTO payrolls (staff_id, staff_name, staff_role, month, year, base_salary, allowance, teaching_fee, deductions, net_salary, status, paid_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
+    `).run(staffId, teacher.name, teacher.position || 'Guru Pengajar', month, year, Math.round(baseSalary), Math.round(allowance), Math.round(teachingFee), Math.round(deductions), netSalary, now);
 
-  res.json({ success: true, message: 'Slip Gaji berhasil diterbitkan!' });
+    db.prepare(`
+      INSERT INTO finance_transactions (type, category, amount, date, description, source_or_recipient)
+      VALUES ('keluar', 'Gaji & Honor Guru', ?, ?, ?, ?)
+    `).run(netSalary, now, `Pembayaran Gaji ${teacher.name} (${month} ${year})`, teacher.name);
+    return result.lastInsertRowid;
+  });
+
+  const payroll = db.prepare('SELECT * FROM payrolls WHERE id = ?').get(payrollId);
+  res.status(201).json({ success: true, payroll, message: 'Slip Gaji berhasil diterbitkan!' });
 });
 
 // ==========================================
@@ -905,15 +1150,24 @@ app.get('/api/blogs', (req, res) => {
 });
 
 app.post('/api/blogs', (req, res) => {
-  const { title, content, author_name, author_role, category, cover_image } = req.body;
-  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-  const now = new Date().toISOString().split('T')[0];
-  const stmt = db.prepare(`
+  const title = cleanText(req.body?.title, 180);
+  const content = cleanText(req.body?.content, 20000);
+  if (!title || !content) return res.status(400).json({ success: false, message: 'Judul dan isi artikel wajib diisi.' });
+  const profile = getSessionProfile(req.auth);
+  const authorName = cleanText(req.body?.author_name, 120) || profile?.name || 'Redaksi Sekolah';
+  const authorRole = cleanText(req.body?.author_role, 60) || profile?.badge || req.auth.role;
+  const category = cleanText(req.body?.category, 60) || 'Umum';
+  const baseSlug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || `artikel-${Date.now()}`;
+  let slug = baseSlug;
+  let counter = 2;
+  while (db.prepare('SELECT id FROM blogs WHERE slug = ?').get(slug)) slug = `${baseSlug}-${counter++}`;
+  const now = todayStr();
+  const result = db.prepare(`
     INSERT INTO blogs (title, slug, content, author_name, author_role, category, cover_image, status, views, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'published', 1, ?)
-  `);
-  stmt.run(title, slug, content, author_name, author_role, category, cover_image || 'https://images.unsplash.com/photo-1497633762265-9d179a990aa6?w=800', now);
-  res.json({ success: true, message: 'Artikel blog sekolah berhasil diterbitkan' });
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'published', 0, ?)
+  `).run(title, slug, content, authorName, authorRole, category, cleanText(req.body?.cover_image, 500) || 'https://images.unsplash.com/photo-1497633762265-9d179a990aa6?w=800', now);
+  const blog = db.prepare('SELECT * FROM blogs WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, blog, message: 'Artikel blog sekolah berhasil diterbitkan' });
 });
 
 // ==========================================
@@ -925,21 +1179,28 @@ app.get('/api/agenda', (req, res) => {
 });
 
 app.post('/api/agenda', (req, res) => {
-  const { title, description, event_date, start_time, end_time, location, audience } = req.body;
-  const stmt = db.prepare(`
+  const title = cleanText(req.body?.title, 180);
+  const eventDate = cleanText(req.body?.event_date, 10);
+  const startTime = cleanText(req.body?.start_time, 5) || null;
+  const endTime = cleanText(req.body?.end_time, 5) || null;
+  if (!title) return res.status(400).json({ success: false, message: 'Judul agenda wajib diisi.' });
+  if (!isValidDate(eventDate)) return res.status(400).json({ success: false, message: 'Tanggal agenda tidak valid (format YYYY-MM-DD).' });
+  if (startTime && endTime && startTime >= endTime) return res.status(400).json({ success: false, message: 'Jam selesai harus setelah jam mulai.' });
+  const result = db.prepare(`
     INSERT INTO agenda (title, description, event_date, start_time, end_time, location, audience)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(title, description, event_date, start_time, end_time, location, audience || 'semua');
-  res.json({ success: true, message: 'Agenda kegiatan sekolah berhasil ditambahkan' });
+  `).run(title, cleanText(req.body?.description, 2000) || null, eventDate, startTime, endTime, cleanText(req.body?.location, 150) || null, cleanText(req.body?.audience, 40) || 'semua');
+  const agenda = db.prepare('SELECT * FROM agenda WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, agenda, message: 'Agenda kegiatan sekolah berhasil ditambahkan' });
 });
 
 app.delete('/api/agenda/:id', (req, res) => {
   try {
-    db.prepare('DELETE FROM agenda WHERE id = ?').run(req.params.id);
+    const result = db.prepare('DELETE FROM agenda WHERE id = ?').run(req.params.id);
+    if (!result.changes) return res.status(404).json({ success: false, message: 'Agenda tidak ditemukan.' });
     res.json({ success: true, message: 'Agenda kegiatan berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus agenda', error: err.message });
+    sendError(res, err, 'Gagal menghapus agenda');
   }
 });
 
@@ -952,14 +1213,18 @@ app.get('/api/broadcasts', (req, res) => {
 });
 
 app.post('/api/broadcasts', (req, res) => {
-  const { title, message, target_role = 'semua', sender_name = 'Kepala Sekolah', is_urgent = 0 } = req.body;
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const stmt = db.prepare(`
+  const title = cleanText(req.body?.title, 180);
+  const message = cleanText(req.body?.message, 3000);
+  if (!title || !message) return res.status(400).json({ success: false, message: 'Judul dan isi pengumuman wajib diisi.' });
+  const profile = getSessionProfile(req.auth);
+  const senderName = cleanText(req.body?.sender_name, 120) || profile?.name || 'Kepala Sekolah';
+  const now = nowStamp();
+  const result = db.prepare(`
     INSERT INTO broadcasts (title, message, target_role, sender_name, created_at, is_urgent)
     VALUES (?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(title, message, target_role, sender_name, now, is_urgent ? 1 : 0);
-  res.json({ success: true, message: 'Pengumuman broadcast instan berhasil disiarkan ke pengguna' });
+  `).run(title, message, cleanText(req.body?.target_role, 40) || 'semua', senderName, now, req.body?.is_urgent ? 1 : 0);
+  const broadcast = db.prepare('SELECT * FROM broadcasts WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, broadcast, message: 'Pengumuman broadcast instan berhasil disiarkan ke pengguna' });
 });
 
 // ==========================================
@@ -977,24 +1242,33 @@ app.get('/api/violations/student/:studentId', (req, res) => {
 });
 
 app.post('/api/violations', (req, res) => {
-  const { student_id, violation_name, category, points, reporter_name, action_taken } = req.body;
+  const studentId = toNumber(req.body?.student_id);
+  const violationName = cleanText(req.body?.violation_name, 180);
+  const category = ['ringan', 'sedang', 'berat'].includes(req.body?.category) ? req.body.category : null;
+  const points = toNumber(req.body?.points, 0);
+  const incidentDate = cleanText(req.body?.incident_date, 10) || todayStr();
+  if (!studentId) return res.status(400).json({ success: false, message: 'Pilih siswa yang dicatat.' });
+  if (!violationName) return res.status(400).json({ success: false, message: 'Jenis pelanggaran wajib diisi.' });
+  if (!category) return res.status(400).json({ success: false, message: "Kategori harus 'ringan', 'sedang', atau 'berat'." });
+  if (points <= 0) return res.status(400).json({ success: false, message: 'Poin pelanggaran harus lebih dari 0.' });
+  if (!isValidDate(incidentDate)) return res.status(400).json({ success: false, message: 'Tanggal kejadian tidak valid.' });
+
   const student = db.prepare(`
     SELECT s.*, c.name as class_name
     FROM students s
     LEFT JOIN classes c ON s.class_id = c.id
     WHERE s.id = ?
-  `).get(student_id);
+  `).get(studentId);
+  if (!student) return res.status(404).json({ success: false, message: 'Siswa tidak ditemukan' });
 
-  if (!student) return res.status(404).json({ message: 'Siswa tidak ditemukan' });
-
-  const now = new Date().toISOString().split('T')[0];
-  const stmt = db.prepare(`
+  const profile = getSessionProfile(req.auth);
+  const result = db.prepare(`
     INSERT INTO violations (student_id, student_name, class_name, violation_name, category, points, incident_date, reporter_name, action_taken, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ditindak')
-  `);
-  stmt.run(student_id, student.name, student.class_name || 'X MIPA', violation_name, category, Number(points), now, reporter_name || 'Guru BP/BK', action_taken || 'Pembinaan lisan');
-
-  res.json({ success: true, message: 'Poin pelanggaran siswa berhasil dicatat ke buku sanksi BK' });
+  `).run(studentId, student.name, student.class_name || 'Belum ada kelas', violationName, category, Math.round(points), incidentDate, cleanText(req.body?.reporter_name, 120) || profile?.name || 'Guru BP/BK', cleanText(req.body?.action_taken, 500) || 'Pembinaan lisan');
+  const violation = db.prepare('SELECT * FROM violations WHERE id = ?').get(result.lastInsertRowid);
+  const totalPoints = db.prepare('SELECT COALESCE(SUM(points), 0) as total FROM violations WHERE student_id = ?').get(studentId).total;
+  res.status(201).json({ success: true, violation, totalPoints, message: 'Poin pelanggaran siswa berhasil dicatat ke buku sanksi BK' });
 });
 
 // ==========================================
@@ -1006,11 +1280,15 @@ app.get('/api/gallery', (req, res) => {
 });
 
 app.post('/api/gallery', (req, res) => {
-  const { title, category, image_url, description } = req.body;
-  const now = new Date().toISOString().split('T')[0];
-  db.prepare('INSERT INTO gallery (title, category, image_url, description, date) VALUES (?, ?, ?, ?, ?)')
-    .run(title, category, image_url, description, now);
-  res.json({ success: true, message: 'Foto galeri berhasil diunggah' });
+  const title = cleanText(req.body?.title, 180);
+  const imageUrl = cleanText(req.body?.image_url, 1000);
+  if (!title) return res.status(400).json({ success: false, message: 'Judul foto wajib diisi.' });
+  if (!/^(https?:\/\/|\/uploads\/|\/pemilos\/)/i.test(imageUrl)) return res.status(400).json({ success: false, message: 'Tautan gambar tidak valid. Unggah foto atau gunakan URL https.' });
+  const now = todayStr();
+  const result = db.prepare('INSERT INTO gallery (title, category, image_url, description, date) VALUES (?, ?, ?, ?, ?)')
+    .run(title, cleanText(req.body?.category, 60) || 'kegiatan', imageUrl, cleanText(req.body?.description, 1000) || null, now);
+  const item = db.prepare('SELECT * FROM gallery WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, item, message: 'Foto galeri berhasil diunggah' });
 });
 
 // ==========================================
@@ -1022,13 +1300,18 @@ app.get('/api/alumni', (req, res) => {
 });
 
 app.post('/api/alumni', (req, res) => {
-  const { name, graduation_year, nisn, current_status, institution_name, position_or_major, phone, email, testimonial } = req.body;
-  const stmt = db.prepare(`
+  const name = cleanText(req.body?.name, 120);
+  const graduationYear = toNumber(req.body?.graduation_year);
+  const currentStatus = cleanText(req.body?.current_status, 60);
+  const currentYear = new Date().getFullYear();
+  if (!name || !currentStatus) return res.status(400).json({ success: false, message: 'Nama alumni dan status saat ini wajib diisi.' });
+  if (!graduationYear || graduationYear < 1950 || graduationYear > currentYear + 1) return res.status(400).json({ success: false, message: `Tahun kelulusan harus antara 1950 dan ${currentYear + 1}.` });
+  const result = db.prepare(`
     INSERT INTO alumni (name, graduation_year, nisn, current_status, institution_name, position_or_major, phone, email, testimonial)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(name, Number(graduation_year), nisn, current_status, institution_name, position_or_major, phone, email, testimonial);
-  res.json({ success: true, message: 'Data alumni berhasil disimpan di direktori tracer' });
+  `).run(name, graduationYear, cleanText(req.body?.nisn, 20) || null, currentStatus, cleanText(req.body?.institution_name, 150) || null, cleanText(req.body?.position_or_major, 150) || null, cleanText(req.body?.phone, 30) || null, cleanText(req.body?.email, 120) || null, cleanText(req.body?.testimonial, 2000) || null);
+  const alumnus = db.prepare('SELECT * FROM alumni WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, alumni: alumnus, message: 'Data alumni berhasil disimpan di direktori tracer' });
 });
 
 // ==========================================
@@ -1040,7 +1323,7 @@ app.get(['/api/ppdb', '/api/ppdb/list'], (req, res) => {
     res.json(list);
   } catch (err) {
     console.error('Error fetching PPDB list:', err);
-    res.status(500).json({ success: false, message: 'Gagal mengambil data PPDB', error: err.message });
+    sendError(res, err, 'Gagal mengambil data PPDB');
   }
 });
 
@@ -1059,8 +1342,21 @@ app.post(['/api/ppdb', '/api/ppdb/register'], (req, res) => {
       });
     }
 
-    const cleanScore = Number(String(average_score || '85').replace(',', '.')) || 85.0;
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const trimmedBirth = cleanText(birth_place_date, 120);
+    const trimmedParent = cleanText(parent_name, 120);
+    const trimmedParentPhone = cleanText(parent_phone, 30);
+    if (!trimmedBirth || !trimmedParent || !trimmedParentPhone) {
+      return res.status(400).json({ success: false, message: 'Tempat/tanggal lahir, nama orang tua, dan nomor WhatsApp orang tua wajib diisi.' });
+    }
+    if (!/^\d{6,20}$/.test(trimmedNisn)) {
+      return res.status(400).json({ success: false, message: 'NISN harus berupa angka (6-20 digit).' });
+    }
+    const parsedScore = Number(String(average_score ?? '').replace(',', '.'));
+    if (!Number.isFinite(parsedScore) || parsedScore < 0 || parsedScore > 100) {
+      return res.status(400).json({ success: false, message: 'Nilai rata-rata rapor harus berada di antara 0 dan 100.' });
+    }
+    const cleanScore = Math.round(parsedScore * 100) / 100;
+    const now = nowStamp();
 
     // Generate guaranteed unique registration number with retry
     let regNo = '';
@@ -1071,7 +1367,7 @@ app.post(['/api/ppdb', '/api/ppdb/register'], (req, res) => {
       attempts++;
       const randomSuffix = Math.floor(1000 + Math.random() * 9000);
       const timePart = Date.now().toString().slice(-4);
-      regNo = `PPDB-2025-${timePart}-${randomSuffix}`;
+      regNo = `PPDB-${new Date().getFullYear()}-${timePart}-${randomSuffix}`;
 
       try {
         const stmt = db.prepare(`
@@ -1085,14 +1381,14 @@ app.post(['/api/ppdb', '/api/ppdb/register'], (req, res) => {
           regNo,
           trimmedName,
           trimmedNisn,
-          gender || 'Laki-laki',
-          birth_place_date ? String(birth_place_date).trim() : 'Bangkalan, 13 Maret 2008',
-          track || 'rapor',
+          gender === 'Perempuan' ? 'Perempuan' : 'Laki-laki',
+          trimmedBirth,
+          cleanText(track, 30) || 'rapor',
           trimmedSchool,
           cleanScore,
-          parent_name ? String(parent_name).trim() : 'Orang Tua / Wali',
-          parent_phone ? String(parent_phone).trim() : '08123456789',
-          address ? String(address).trim() : '-',
+          trimmedParent,
+          trimmedParentPhone,
+          cleanText(address, 300) || '-',
           now
         );
 
@@ -1128,22 +1424,26 @@ app.post(['/api/ppdb', '/api/ppdb/register'], (req, res) => {
   }
 });
 
+const PPDB_STATUSES = ['menunggu', 'terverifikasi', 'diterima', 'cadangan', 'ditolak'];
 app.put('/api/ppdb/:id/status', (req, res) => {
   try {
-    const { status } = req.body;
-    db.prepare('UPDATE ppdb SET status = ? WHERE id = ?').run(status, req.params.id);
-    res.json({ success: true, message: `Status kelulusan PPDB diubah menjadi: ${status.toUpperCase()}` });
+    const status = cleanText(req.body?.status, 30).toLowerCase();
+    if (!PPDB_STATUSES.includes(status)) return res.status(400).json({ success: false, message: `Status PPDB harus salah satu dari: ${PPDB_STATUSES.join(', ')}.` });
+    const result = db.prepare('UPDATE ppdb SET status = ? WHERE id = ?').run(status, req.params.id);
+    if (!result.changes) return res.status(404).json({ success: false, message: 'Data pendaftar tidak ditemukan.' });
+    res.json({ success: true, status, message: `Status kelulusan PPDB diubah menjadi: ${status.toUpperCase()}` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengubah status PPDB', error: err.message });
+    sendError(res, err, 'Gagal mengubah status PPDB');
   }
 });
 
 app.delete('/api/ppdb/:id', (req, res) => {
   try {
-    db.prepare('DELETE FROM ppdb WHERE id = ?').run(req.params.id);
+    const result = db.prepare('DELETE FROM ppdb WHERE id = ?').run(req.params.id);
+    if (!result.changes) return res.status(404).json({ success: false, message: 'Data pendaftar tidak ditemukan.' });
     res.json({ success: true, message: 'Data pendaftar PPDB berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus data PPDB', error: err.message });
+    sendError(res, err, 'Gagal menghapus data PPDB');
   }
 });
 
@@ -1156,14 +1456,19 @@ app.get('/api/archives', (req, res) => {
 });
 
 app.post('/api/archives', (req, res) => {
-  const { title, doc_number, category, file_size = '2.1 MB', uploaded_by = 'Petugas Arsip', notes } = req.body;
-  const now = new Date().toISOString().split('T')[0];
-  const stmt = db.prepare(`
+  const title = cleanText(req.body?.title, 200);
+  const category = cleanText(req.body?.category, 60);
+  if (!title || !category) return res.status(400).json({ success: false, message: 'Judul dan kategori dokumen wajib diisi.' });
+  const fileUrl = cleanText(req.body?.file_url, 1000);
+  if (fileUrl && !/^(https?:\/\/|\/uploads\/)/i.test(fileUrl)) return res.status(400).json({ success: false, message: 'Tautan berkas harus berupa URL https atau berkas unggahan.' });
+  const profile = getSessionProfile(req.auth);
+  const now = todayStr();
+  const result = db.prepare(`
     INSERT INTO digital_archives (title, doc_number, category, file_url, file_size, upload_date, uploaded_by, notes)
-    VALUES (?, ?, ?, '#', ?, ?, ?, ?)
-  `);
-  stmt.run(title, doc_number, category, file_size, now, uploaded_by, notes);
-  res.json({ success: true, message: 'Dokumen arsip digital resmi tersimpan di repositori' });
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(title, cleanText(req.body?.doc_number, 80) || null, category, fileUrl || '#', cleanText(req.body?.file_size, 20) || null, now, cleanText(req.body?.uploaded_by, 120) || profile?.name || 'Petugas Arsip', cleanText(req.body?.notes, 1000) || null);
+  const document = db.prepare('SELECT * FROM digital_archives WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, document, message: 'Dokumen arsip digital resmi tersimpan di repositori' });
 });
 
 // ==========================================
@@ -1196,18 +1501,19 @@ app.get('/api/elearning/modules', (req, res) => {
     const modules = db.prepare('SELECT * FROM elearning_modules ORDER BY id DESC').all();
     res.json(modules);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat modul: ' + err.message });
+    sendError(res, err, 'Gagal memuat modul');
   }
 });
 
 app.post('/api/elearning/modules', (req, res) => {
   try {
-    const { subject_name, class_name, teacher_name, title, description, file_url, video_url } = req.body;
-    if (!title || !title.trim()) {
+    if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat mengunggah materi pembelajaran.' });
+    const { subject_name, class_name, teacher_name, title, description, file_url, video_url } = req.body || {};
+    if (typeof title !== 'string' || !title.trim()) {
       return res.status(400).json({ success: false, message: 'Judul modul pembelajaran wajib diisi!' });
     }
     const formattedVideo = formatVideoEmbed(video_url);
-    const now = new Date().toISOString().split('T')[0];
+    const now = todayStr();
     const stmt = db.prepare(`
       INSERT INTO elearning_modules (subject_name, class_name, teacher_name, title, description, file_url, video_url, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1225,23 +1531,27 @@ app.post('/api/elearning/modules', (req, res) => {
     const newModule = db.prepare('SELECT * FROM elearning_modules WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ success: true, moduleId: result.lastInsertRowid, module: newModule, message: 'Materi pembelajaran e-learning berhasil diunggah' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal membuat modul: ' + err.message });
+    sendError(res, err, 'Gagal membuat modul');
   }
 });
 
 app.delete('/api/elearning/modules/:id', (req, res) => {
   try {
+    if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat menghapus modul.' });
     const id = Number(req.params.id);
-    const tasks = db.prepare('SELECT id FROM elearning_tasks WHERE module_id = ?').all(id);
-    for (const t of tasks) {
-      db.prepare('DELETE FROM elearning_submissions WHERE task_id = ?').run(t.id);
-    }
-    db.prepare('DELETE FROM elearning_tasks WHERE module_id = ?').run(id);
-    db.prepare('DELETE FROM elearning_discussions WHERE module_id = ?').run(id);
-    db.prepare('DELETE FROM elearning_modules WHERE id = ?').run(id);
+    const removed = transaction(() => {
+      const tasks = db.prepare('SELECT id FROM elearning_tasks WHERE module_id = ?').all(id);
+      for (const t of tasks) {
+        db.prepare('DELETE FROM elearning_submissions WHERE task_id = ?').run(t.id);
+      }
+      db.prepare('DELETE FROM elearning_tasks WHERE module_id = ?').run(id);
+      db.prepare('DELETE FROM elearning_discussions WHERE module_id = ?').run(id);
+      return db.prepare('DELETE FROM elearning_modules WHERE id = ?').run(id).changes;
+    });
+    if (!removed) return res.status(404).json({ success: false, message: 'Modul tidak ditemukan.' });
     res.json({ success: true, message: 'Modul pembelajaran berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus modul: ' + err.message });
+    sendError(res, err, 'Gagal menghapus modul');
   }
 });
 
@@ -1255,17 +1565,21 @@ app.get(['/api/elearning/tasks', '/api/elearning/tasks/:moduleId'], (req, res) =
       res.json(tasks);
     }
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat tugas: ' + err.message });
+    sendError(res, err, 'Gagal memuat tugas');
   }
 });
 
 app.post('/api/elearning/tasks', (req, res) => {
   try {
-    const { module_id, title, description, deadline, max_score = 100 } = req.body;
-    if (!title || !title.trim() || !module_id) {
+    if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat membuat tugas.' });
+    const { module_id, title, description, deadline, max_score = 100 } = req.body || {};
+    if (typeof title !== 'string' || !title.trim() || !module_id) {
       return res.status(400).json({ success: false, message: 'Judul tugas dan modul target wajib diisi!' });
     }
-    const now = new Date().toISOString().split('T')[0];
+    if (!db.prepare('SELECT id FROM elearning_modules WHERE id = ?').get(Number(module_id))) {
+      return res.status(404).json({ success: false, message: 'Modul target tidak ditemukan.' });
+    }
+    const now = todayStr();
     const stmt = db.prepare(`
       INSERT INTO elearning_tasks (module_id, title, description, deadline, max_score, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -1273,45 +1587,91 @@ app.post('/api/elearning/tasks', (req, res) => {
     const result = stmt.run(Number(module_id), title.trim(), description || '', deadline || 'Segera', Number(max_score) || 100, now);
     res.status(201).json({ success: true, taskId: result.lastInsertRowid, message: 'Tugas e-learning berhasil dibuat untuk siswa' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal membuat tugas: ' + err.message });
+    sendError(res, err, 'Gagal membuat tugas');
   }
 });
 
 app.delete('/api/elearning/tasks/:id', (req, res) => {
   try {
+    if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat menghapus tugas.' });
     const id = Number(req.params.id);
-    db.prepare('DELETE FROM elearning_submissions WHERE task_id = ?').run(id);
-    db.prepare('DELETE FROM elearning_tasks WHERE id = ?').run(id);
+    const removed = transaction(() => {
+      db.prepare('DELETE FROM elearning_submissions WHERE task_id = ?').run(id);
+      return db.prepare('DELETE FROM elearning_tasks WHERE id = ?').run(id).changes;
+    });
+    if (!removed) return res.status(404).json({ success: false, message: 'Tugas tidak ditemukan.' });
     res.json({ success: true, message: 'Tugas e-learning berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus tugas: ' + err.message });
+    sendError(res, err, 'Gagal menghapus tugas');
   }
 });
 
 app.get('/api/elearning/submissions/:taskId', (req, res) => {
   try {
+    if (!isStaffRole(req.auth.role)) {
+      // Siswa hanya melihat jawaban miliknya sendiri.
+      const profile = getSessionProfile(req.auth);
+      const ownId = profile?.student?.id ?? profile?.id ?? -1;
+      return res.json(db.prepare('SELECT * FROM elearning_submissions WHERE task_id = ? AND student_id = ? ORDER BY id DESC').all(req.params.taskId, ownId));
+    }
     const subs = db.prepare('SELECT * FROM elearning_submissions WHERE task_id = ? ORDER BY id DESC').all(req.params.taskId);
     res.json(subs);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat submisi: ' + err.message });
+    sendError(res, err, 'Gagal memuat submisi');
   }
 });
 
 app.post('/api/elearning/submissions', (req, res) => {
   try {
-    const { task_id, student_id, student_name, submission_text } = req.body;
-    if (!submission_text || !submission_text.trim()) {
+    const taskId = toNumber(req.body?.task_id);
+    const submissionText = cleanText(req.body?.submission_text, 20000);
+    if (!submissionText) {
       return res.status(400).json({ success: false, message: 'Teks jawaban tugas wajib diisi!' });
     }
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const stmt = db.prepare(`
-      INSERT INTO elearning_submissions (task_id, student_id, student_name, submission_text, submitted_at, score, feedback)
-      VALUES (?, ?, ?, ?, ?, 90, 'Tugas sudah diterima dan dinilai otomatis')
-    `);
-    stmt.run(Number(task_id), Number(student_id || 1), student_name || 'Siswa', submission_text.trim(), now);
-    res.status(201).json({ success: true, message: 'Jawaban tugas siswa berhasil dikumpulkan!' });
+    const task = taskId ? db.prepare('SELECT * FROM elearning_tasks WHERE id = ?').get(taskId) : null;
+    if (!task) return res.status(404).json({ success: false, message: 'Tugas tidak ditemukan.' });
+    const profile = getSessionProfile(req.auth);
+    const studentId = isStaffRole(req.auth.role) ? toNumber(req.body?.student_id, 0) : (profile?.student?.id ?? profile?.id ?? 0);
+    const studentName = cleanText(req.body?.student_name, 120) || profile?.name || 'Siswa';
+    const now = nowStamp();
+
+    // Pengumpulan ulang sebelum dinilai memperbarui jawaban lama, bukan menggandakan.
+    const existing = db.prepare('SELECT * FROM elearning_submissions WHERE task_id = ? AND student_id = ? ORDER BY id DESC LIMIT 1').get(taskId, studentId);
+    if (existing && existing.score !== null) {
+      return res.status(409).json({ success: false, message: 'Tugas ini sudah dinilai guru dan tidak dapat dikirim ulang.' });
+    }
+    let submissionId;
+    if (existing) {
+      db.prepare('UPDATE elearning_submissions SET submission_text = ?, submitted_at = ?, student_name = ? WHERE id = ?').run(submissionText, now, studentName, existing.id);
+      submissionId = existing.id;
+    } else {
+      const result = db.prepare(`
+        INSERT INTO elearning_submissions (task_id, student_id, student_name, submission_text, submitted_at, score, feedback)
+        VALUES (?, ?, ?, ?, ?, NULL, 'Menunggu penilaian guru')
+      `).run(taskId, studentId, studentName, submissionText, now);
+      submissionId = result.lastInsertRowid;
+    }
+    const submission = db.prepare('SELECT * FROM elearning_submissions WHERE id = ?').get(submissionId);
+    res.status(existing ? 200 : 201).json({ success: true, submission, updated: Boolean(existing), message: existing ? 'Jawaban tugas berhasil diperbarui!' : 'Jawaban tugas siswa berhasil dikumpulkan!' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengirim jawaban tugas: ' + err.message });
+    sendError(res, err, 'Gagal mengirim jawaban tugas');
+  }
+});
+
+// Penilaian tugas oleh guru
+app.put('/api/elearning/submissions/:id', (req, res) => {
+  try {
+    if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat menilai tugas.' });
+    const submission = db.prepare('SELECT s.*, t.max_score FROM elearning_submissions s LEFT JOIN elearning_tasks t ON t.id = s.task_id WHERE s.id = ?').get(req.params.id);
+    if (!submission) return res.status(404).json({ success: false, message: 'Jawaban tugas tidak ditemukan.' });
+    const maxScore = Number(submission.max_score) || 100;
+    const score = toNumber(req.body?.score);
+    if (score === null || score < 0 || score > maxScore) return res.status(400).json({ success: false, message: `Nilai harus berupa angka 0-${maxScore}.` });
+    db.prepare('UPDATE elearning_submissions SET score = ?, feedback = ? WHERE id = ?').run(Math.round(score), cleanText(req.body?.feedback, 2000) || 'Sudah dinilai guru', submission.id);
+    const updated = db.prepare('SELECT * FROM elearning_submissions WHERE id = ?').get(submission.id);
+    res.json({ success: true, submission: updated, message: 'Nilai tugas berhasil disimpan.' });
+  } catch (err) {
+    sendError(res, err, 'Gagal menyimpan nilai tugas');
   }
 });
 
@@ -1320,7 +1680,7 @@ app.get('/api/elearning/discussions/:moduleId', (req, res) => {
     const msgs = db.prepare('SELECT * FROM elearning_discussions WHERE module_id = ? ORDER BY id ASC').all(req.params.moduleId);
     res.json(msgs);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat diskusi: ' + err.message });
+    sendError(res, err, 'Gagal memuat diskusi');
   }
 });
 
@@ -1330,38 +1690,80 @@ app.post('/api/elearning/discussions', (req, res) => {
     if (!message || !message.trim()) {
       return res.status(400).json({ success: false, message: 'Pesan komentar tidak boleh kosong!' });
     }
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const now = nowStamp();
     const stmt = db.prepare(`
       INSERT INTO elearning_discussions (module_id, user_name, user_role, message, created_at)
       VALUES (?, ?, ?, ?, ?)
     `);
-    stmt.run(Number(module_id), user_name || 'Pengguna', user_role || 'Warga Sekolah', message.trim(), now);
+    const profile = getSessionProfile(req.auth);
+    stmt.run(Number(module_id), cleanText(user_name, 120) || profile?.name || 'Pengguna', cleanText(user_role, 60) || profile?.badge || req.auth.role || 'Warga Sekolah', message.trim(), now);
     res.status(201).json({ success: true, message: 'Komentar diskusi terkirim' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengirim komentar: ' + err.message });
+    sendError(res, err, 'Gagal mengirim komentar');
   }
 });
 
 // ==========================================
 // 19. E-RAPOR & TRANSKRIP NILAI SISWA
 // ==========================================
+function currentAcademicYear(date = new Date()) {
+  const startYear = date.getMonth() >= 6 ? date.getFullYear() : date.getFullYear() - 1;
+  return `${startYear}/${startYear + 1}`;
+}
+
 app.get('/api/erapor/grades', (req, res) => {
-  const { student_id = 1, semester = 'Ganjil', academic_year = '2024/2025' } = req.query;
-  const grades = db.prepare('SELECT * FROM grades WHERE student_id = ? AND semester = ? AND academic_year = ?').all(Number(student_id), semester, academic_year);
-  res.json(grades);
+  let studentId = toNumber(req.query.student_id, 1);
+  if (!isStaffRole(req.auth.role)) {
+    // Siswa/orang tua hanya melihat nilai siswa yang terkait dengan akunnya.
+    const profile = getSessionProfile(req.auth);
+    if (!profile?.student) return res.json([]);
+    studentId = profile.student.id;
+  }
+  const semester = cleanText(req.query.semester, 20);
+  const academicYear = cleanText(req.query.academic_year, 20);
+  let query = 'SELECT * FROM grades WHERE student_id = ?';
+  const params = [studentId];
+  if (semester) { query += ' AND semester = ?'; params.push(semester); }
+  if (academicYear) { query += ' AND academic_year = ?'; params.push(academicYear); }
+  query += ' ORDER BY academic_year DESC, semester DESC, subject_name ASC';
+  res.json(db.prepare(query).all(...params));
 });
 
 app.post('/api/erapor/grades', (req, res) => {
-  const { student_id, student_name, class_name, subject_name, semester = 'Ganjil', academic_year = '2024/2025', formative_score, midterm_score, final_score, competence_achievement = '', teacher_notes = '' } = req.body;
-  const final_grade = Math.round(((Number(formative_score) * 0.4) + (Number(midterm_score) * 0.3) + (Number(final_score) * 0.3)) * 10) / 10;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya guru/staf yang dapat menginput nilai.' });
+  const studentId = toNumber(req.body?.student_id);
+  const subjectName = cleanText(req.body?.subject_name, 120);
+  const semester = cleanText(req.body?.semester, 20) || 'Ganjil';
+  const academicYear = cleanText(req.body?.academic_year, 20) || currentAcademicYear();
+  const formative = toNumber(req.body?.formative_score);
+  const midterm = toNumber(req.body?.midterm_score);
+  const finalScore = toNumber(req.body?.final_score);
+  if (!studentId) return res.status(400).json({ success: false, message: 'Siswa wajib dipilih.' });
+  if (!subjectName) return res.status(400).json({ success: false, message: 'Mata pelajaran wajib diisi.' });
+  if ([formative, midterm, finalScore].some((value) => value === null || value < 0 || value > 100)) return res.status(400).json({ success: false, message: 'Setiap komponen nilai harus berupa angka 0-100.' });
+  const student = getLinkedStudent(studentId);
+  if (!student) return res.status(404).json({ success: false, message: 'Siswa tidak ditemukan.' });
+  const studentName = cleanText(req.body?.student_name, 120) || student.name;
+  const className = cleanText(req.body?.class_name, 60) || student.class_name || 'Belum ada kelas';
+  const competence = cleanText(req.body?.competence_achievement, 2000);
+  const notes = cleanText(req.body?.teacher_notes, 2000);
+  const final_grade = Math.round(((formative * 0.4) + (midterm * 0.3) + (finalScore * 0.3)) * 10) / 10;
   const predicate = final_grade >= 90 ? 'A' : final_grade >= 80 ? 'B' : final_grade >= 70 ? 'C' : 'D';
   
-  const stmt = db.prepare(`
-    INSERT INTO grades (student_id, student_name, class_name, subject_name, semester, academic_year, formative_score, midterm_score, final_score, final_grade, predicate, competence_achievement, teacher_notes)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(Number(student_id), student_name, class_name, subject_name, semester, academic_year, Number(formative_score), Number(midterm_score), Number(final_score), final_grade, predicate, competence_achievement, teacher_notes);
-  res.json({ success: true, message: 'Nilai mata pelajaran berhasil disimpan!' });
+  const existing = db.prepare('SELECT id FROM grades WHERE student_id = ? AND subject_name = ? AND semester = ? AND academic_year = ?').get(studentId, subjectName, semester, academicYear);
+  if (existing) {
+    db.prepare(`
+      UPDATE grades SET student_name = ?, class_name = ?, formative_score = ?, midterm_score = ?, final_score = ?, final_grade = ?, predicate = ?, competence_achievement = ?, teacher_notes = ?
+      WHERE id = ?
+    `).run(studentName, className, formative, midterm, finalScore, final_grade, predicate, competence, notes, existing.id);
+  } else {
+    db.prepare(`
+      INSERT INTO grades (student_id, student_name, class_name, subject_name, semester, academic_year, formative_score, midterm_score, final_score, final_grade, predicate, competence_achievement, teacher_notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(studentId, studentName, className, subjectName, semester, academicYear, formative, midterm, finalScore, final_grade, predicate, competence, notes);
+  }
+  const grade = db.prepare('SELECT * FROM grades WHERE student_id = ? AND subject_name = ? AND semester = ? AND academic_year = ?').get(studentId, subjectName, semester, academicYear);
+  res.status(existing ? 200 : 201).json({ success: true, grade, updated: Boolean(existing), final_grade, predicate, message: existing ? 'Nilai mata pelajaran berhasil diperbarui!' : 'Nilai mata pelajaran berhasil disimpan!' });
 });
 
 // ==========================================
@@ -1372,7 +1774,7 @@ app.get('/api/library/books', (req, res) => {
     const books = db.prepare('SELECT * FROM library_books ORDER BY id DESC').all();
     res.json(books);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat katalog buku: ' + err.message });
+    sendError(res, err, 'Gagal memuat katalog buku');
   }
 });
 
@@ -1432,18 +1834,23 @@ app.post('/api/library/books', (req, res) => {
       message: `Buku "${title.trim()}" berhasil ditambahkan ke katalog perpustakaan!`
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan buku: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan buku');
   }
 });
 
 app.delete('/api/library/books/:id', (req, res) => {
   try {
     const bookId = Number(req.params.id);
-    db.prepare('DELETE FROM book_loans WHERE book_id = ?').run(bookId);
-    db.prepare('DELETE FROM library_books WHERE id = ?').run(bookId);
+    const activeLoans = db.prepare("SELECT COUNT(*) AS count FROM book_loans WHERE book_id = ? AND status = 'dipinjam'").get(bookId).count;
+    if (activeLoans > 0) return res.status(409).json({ success: false, message: `Buku masih dipinjam (${activeLoans} eksemplar). Selesaikan pengembalian sebelum menghapus.` });
+    const removed = transaction(() => {
+      db.prepare('DELETE FROM book_loans WHERE book_id = ?').run(bookId);
+      return db.prepare('DELETE FROM library_books WHERE id = ?').run(bookId).changes;
+    });
+    if (!removed) return res.status(404).json({ success: false, message: 'Buku tidak ditemukan.' });
     res.json({ success: true, message: 'Buku berhasil dihapus dari katalog perpustakaan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus buku: ' + err.message });
+    sendError(res, err, 'Gagal menghapus buku');
   }
 });
 
@@ -1452,28 +1859,40 @@ app.get('/api/library/loans', (req, res) => {
     const loans = db.prepare('SELECT * FROM book_loans ORDER BY id DESC').all();
     res.json(loans);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat daftar peminjaman: ' + err.message });
+    sendError(res, err, 'Gagal memuat daftar peminjaman');
   }
 });
 
 app.post('/api/library/loans', (req, res) => {
   try {
-    const { book_id, borrower_type = 'siswa', borrower_id = 1, borrower_name, borrow_date, due_date, notes = '' } = req.body;
-    const book = db.prepare('SELECT * FROM library_books WHERE id = ?').get(book_id);
-    if (!book || book.available_copies < 1) {
-      return res.status(400).json({ success: false, message: 'Stok buku ini sedang habis dipinjam!' });
-    }
+    const bookId = toNumber(req.body?.book_id);
+    const borrowerType = req.body?.borrower_type === 'guru' ? 'guru' : 'siswa';
+    const borrowerId = toNumber(req.body?.borrower_id, 0);
+    const borrowerName = cleanText(req.body?.borrower_name, 120);
+    const borrowDate = cleanText(req.body?.borrow_date, 10) || todayStr();
+    const dueDate = cleanText(req.body?.due_date, 10);
+    if (!bookId) return res.status(400).json({ success: false, message: 'Pilih buku yang akan dipinjam.' });
+    if (!borrowerName) return res.status(400).json({ success: false, message: 'Nama peminjam wajib diisi.' });
+    if (!isValidDate(borrowDate) || !isValidDate(dueDate)) return res.status(400).json({ success: false, message: 'Tanggal pinjam dan jatuh tempo harus valid (YYYY-MM-DD).' });
+    if (dueDate < borrowDate) return res.status(400).json({ success: false, message: 'Tanggal jatuh tempo tidak boleh sebelum tanggal pinjam.' });
 
-    const stmt = db.prepare(`
-      INSERT INTO book_loans (book_id, book_title, borrower_type, borrower_id, borrower_name, borrow_date, due_date, status, fine_amount, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'dipinjam', 0, ?)
-    `);
-    stmt.run(Number(book_id), book.title, borrower_type, Number(borrower_id), borrower_name, borrow_date, due_date, notes);
-    db.prepare('UPDATE library_books SET available_copies = available_copies - 1 WHERE id = ?').run(Number(book_id));
+    const created = transaction(() => {
+      const book = db.prepare('SELECT * FROM library_books WHERE id = ?').get(bookId);
+      if (!book) throw Object.assign(new Error('Buku tidak ditemukan.'), { httpStatus: 404 });
+      if (book.available_copies < 1) throw Object.assign(new Error('Stok buku ini sedang habis dipinjam!'), { httpStatus: 400 });
+      const result = db.prepare(`
+        INSERT INTO book_loans (book_id, book_title, borrower_type, borrower_id, borrower_name, borrow_date, due_date, status, fine_amount, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'dipinjam', 0, ?)
+      `).run(bookId, book.title, borrowerType, borrowerId, borrowerName, borrowDate, dueDate, cleanText(req.body?.notes, 500));
+      db.prepare('UPDATE library_books SET available_copies = available_copies - 1 WHERE id = ?').run(bookId);
+      return { id: result.lastInsertRowid, title: book.title };
+    });
 
-    res.json({ success: true, message: `Peminjaman buku "${book.title}" berhasil dicatat!` });
+    const loan = db.prepare('SELECT * FROM book_loans WHERE id = ?').get(created.id);
+    res.status(201).json({ success: true, loan, message: `Peminjaman buku "${created.title}" berhasil dicatat!` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memproses peminjaman: ' + err.message });
+    if (err.httpStatus) return res.status(err.httpStatus).json({ success: false, message: err.message });
+    sendError(res, err, 'Gagal memproses peminjaman');
   }
 });
 
@@ -1486,13 +1905,24 @@ app.post('/api/library/loans/:id/return', (req, res) => {
       return res.json({ success: true, already_returned: true, message: `Buku "${loan.book_title}" sudah tercatat dikembalikan sebelumnya.` });
     }
 
-    const nowStr = new Date().toISOString().split('T')[0];
-    db.prepare('UPDATE book_loans SET return_date = ?, status = "dikembalikan" WHERE id = ?').run(nowStr, loanId);
-    db.prepare('UPDATE library_books SET available_copies = available_copies + 1 WHERE id = ?').run(loan.book_id);
+    const nowStr = todayStr();
+    const lateDays = loan.due_date && nowStr > loan.due_date
+      ? Math.max(0, Math.round((new Date(`${nowStr}T00:00:00`) - new Date(`${loan.due_date}T00:00:00`)) / 86400000))
+      : 0;
+    const fine = lateDays * 1000; // Denda keterlambatan Rp 1.000 per hari
+    transaction(() => {
+      db.prepare("UPDATE book_loans SET return_date = ?, status = 'dikembalikan', fine_amount = ? WHERE id = ?").run(nowStr, fine, loanId);
+      db.prepare('UPDATE library_books SET available_copies = MIN(total_copies, available_copies + 1) WHERE id = ?').run(loan.book_id);
+    });
 
-    res.json({ success: true, message: `Buku "${loan.book_title}" berhasil dikembalikan!` });
+    res.json({
+      success: true,
+      fine_amount: fine,
+      late_days: lateDays,
+      message: `Buku "${loan.book_title}" berhasil dikembalikan!${fine ? ` Terlambat ${lateDays} hari, denda Rp ${fine.toLocaleString('id-ID')}.` : ''}`
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengembalikan buku: ' + err.message });
+    sendError(res, err, 'Gagal mengembalikan buku');
   }
 });
 
@@ -1505,9 +1935,29 @@ app.get('/api/extracurriculars', (req, res) => {
 });
 
 app.post('/api/extracurriculars/join', (req, res) => {
-  const { extracurricular_id, student_name } = req.body;
-  db.prepare('UPDATE extracurriculars SET member_count = member_count + 1 WHERE id = ?').run(Number(extracurricular_id));
-  res.json({ success: true, message: `Pendaftaran ekstrakurikuler atas nama ${student_name} berhasil!` });
+  const extracurricularId = toNumber(req.body?.extracurricular_id);
+  const profile = getSessionProfile(req.auth);
+  const studentName = cleanText(req.body?.student_name, 120) || profile?.name;
+  const className = cleanText(req.body?.class_name, 60) || profile?.student?.class_name || null;
+  if (!extracurricularId) return res.status(400).json({ success: false, message: 'Pilih ekstrakurikuler yang ingin diikuti.' });
+  if (!studentName) return res.status(400).json({ success: false, message: 'Nama pendaftar wajib diisi.' });
+  const ekskul = db.prepare('SELECT * FROM extracurriculars WHERE id = ?').get(extracurricularId);
+  if (!ekskul) return res.status(404).json({ success: false, message: 'Ekstrakurikuler tidak ditemukan.' });
+  const duplicate = db.prepare('SELECT id FROM extracurricular_members WHERE extracurricular_id = ? AND lower(student_name) = lower(?)').get(extracurricularId, studentName);
+  if (duplicate) return res.status(409).json({ success: false, message: `${studentName} sudah terdaftar sebagai anggota ${ekskul.name}.` });
+  transaction(() => {
+    db.prepare('INSERT INTO extracurricular_members (extracurricular_id, student_name, class_name, reason, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(extracurricularId, studentName, className, cleanText(req.body?.reason, 500) || null, nowStamp());
+    db.prepare('UPDATE extracurriculars SET member_count = member_count + 1 WHERE id = ?').run(extracurricularId);
+  });
+  const updated = db.prepare('SELECT * FROM extracurriculars WHERE id = ?').get(extracurricularId);
+  res.status(201).json({ success: true, extracurricular: updated, message: `Pendaftaran ekstrakurikuler ${ekskul.name} atas nama ${studentName} berhasil!` });
+});
+
+app.get('/api/extracurriculars/:id/members', (req, res) => {
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Daftar anggota hanya untuk pembina/staf.' });
+  const members = db.prepare('SELECT * FROM extracurricular_members WHERE extracurricular_id = ? ORDER BY id DESC').all(Number(req.params.id));
+  res.json(members);
 });
 
 // ==========================================
@@ -1519,14 +1969,36 @@ app.get('/api/counseling/sessions', (req, res) => {
 });
 
 app.post('/api/counseling/sessions', (req, res) => {
-  const { student_id = 1, student_name, class_name, counselor_name = 'Rina Marlina, S.Psi', session_date, session_time, category = 'karir', topic, notes = '' } = req.body;
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const stmt = db.prepare(`
+  const studentName = cleanText(req.body?.student_name, 120);
+  const className = cleanText(req.body?.class_name, 60);
+  const topic = cleanText(req.body?.topic, 300);
+  const sessionDate = cleanText(req.body?.session_date, 10);
+  const sessionTime = cleanText(req.body?.session_time, 5);
+  const category = ['akademik', 'pribadi', 'sosial', 'karir'].includes(req.body?.category) ? req.body.category : 'karir';
+  const profile = getSessionProfile(req.auth);
+  let studentId = toNumber(req.body?.student_id);
+  if (!studentId && profile?.student) studentId = profile.student.id;
+  if (!studentName || !className || !topic) return res.status(400).json({ success: false, message: 'Nama siswa, kelas, dan topik konseling wajib diisi.' });
+  if (!isValidDate(sessionDate) || !/^\d{2}:\d{2}$/.test(sessionTime)) return res.status(400).json({ success: false, message: 'Tanggal (YYYY-MM-DD) dan jam sesi (HH:MM) harus valid.' });
+  if (!studentId || !db.prepare('SELECT id FROM students WHERE id = ?').get(studentId)) return res.status(400).json({ success: false, message: 'Siswa yang dipilih tidak ditemukan di Buku Induk.' });
+  const counselorName = cleanText(req.body?.counselor_name, 120) || (req.auth.role === 'kepala_bk' ? profile?.name : null) || 'Rina Marlina, S.Psi.';
+  const now = nowStamp();
+  const result = db.prepare(`
     INSERT INTO counseling_sessions (student_id, student_name, class_name, counselor_name, session_date, session_time, category, topic, notes, status, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dijadwalkan', ?)
-  `);
-  stmt.run(Number(student_id), student_name, class_name, counselor_name, session_date, session_time, category, topic, notes, now);
-  res.json({ success: true, message: 'Jadwal sesi bimbingan konseling berhasil diajukan!' });
+  `).run(studentId, studentName, className, counselorName, sessionDate, sessionTime, category, topic, cleanText(req.body?.notes, 2000), now);
+  const session = db.prepare('SELECT * FROM counseling_sessions WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json({ success: true, session, message: 'Jadwal sesi bimbingan konseling berhasil diajukan!' });
+});
+
+app.patch('/api/counseling/sessions/:id/status', (req, res) => {
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya konselor/staf yang dapat mengubah status sesi.' });
+  const status = cleanText(req.body?.status, 20);
+  if (!['dijadwalkan', 'selesai', 'dibatalkan'].includes(status)) return res.status(400).json({ success: false, message: 'Status sesi tidak valid.' });
+  const notes = cleanText(req.body?.notes, 2000) || null;
+  const result = db.prepare('UPDATE counseling_sessions SET status = ?, notes = COALESCE(?, notes) WHERE id = ?').run(status, notes, req.params.id);
+  if (!result.changes) return res.status(404).json({ success: false, message: 'Sesi konseling tidak ditemukan.' });
+  res.json({ success: true, status, message: 'Status sesi konseling diperbarui.' });
 });
 
 // ==========================================
@@ -1561,7 +2033,7 @@ app.post('/api/careers/opportunities', (req, res) => {
     return res.status(400).json({ success: false, message: 'Detail peluang melebihi batas panjang yang diizinkan.' });
   }
 
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const now = nowStamp();
   const result = db.prepare(`
     INSERT INTO career_opportunities (title, opportunity_type, organization, location, description, requirements, deadline, contact_person, is_active, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -1593,7 +2065,7 @@ app.post('/api/careers/applications', (req, res) => {
   const existing = db.prepare('SELECT id FROM career_applications WHERE opportunity_id = ? AND applicant_name = ?').get(opportunity.id, cleanName);
   if (existing) return res.status(409).json({ success: false, message: 'Minat untuk peluang ini sudah pernah dikirim.' });
 
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const now = nowStamp();
   const result = db.prepare(`
     INSERT INTO career_applications (opportunity_id, applicant_name, applicant_role, class_name, notes, status, created_at)
     VALUES (?, ?, ?, ?, ?, 'minat', ?)
@@ -1632,7 +2104,7 @@ app.post('/api/feedback', (req, res) => {
   }
 
   const anonymous = is_anonymous ? 1 : 0;
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const now = nowStamp();
   const submissionCode = `ASP-${Date.now().toString().slice(-8)}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
   const result = db.prepare(`
     INSERT INTO school_feedback (submission_code, sender_name, sender_role, is_anonymous, category, subject, message, status, created_at)
@@ -1643,6 +2115,7 @@ app.post('/api/feedback', (req, res) => {
 });
 
 app.patch('/api/feedback/:id/status', (req, res) => {
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya staf sekolah yang dapat menindaklanjuti aspirasi.' });
   const allowedStatuses = ['baru', 'ditinjau', 'ditindaklanjuti', 'selesai'];
   const { status } = req.body;
   if (!allowedStatuses.includes(status)) return res.status(400).json({ success: false, message: 'Status aspirasi tidak valid.' });
@@ -1654,13 +2127,24 @@ app.patch('/api/feedback/:id/status', (req, res) => {
 // ==========================================
 // 25. UKS & IZIN SISWA
 // ==========================================
+// Siswa/orang tua hanya melihat catatan UKS & izin milik siswa yang terkait akunnya.
+function ownStudentFilter(req) {
+  if (isStaffRole(req.auth.role)) return null;
+  const profile = getSessionProfile(req.auth);
+  return profile?.student || { id: -1, name: '' };
+}
+
 app.get('/api/uks/visits', (req, res) => {
-  const visits = db.prepare('SELECT * FROM uks_visits ORDER BY visit_date DESC, visit_time DESC, id DESC LIMIT 100').all();
+  const own = ownStudentFilter(req);
+  const visits = own
+    ? db.prepare('SELECT * FROM uks_visits WHERE student_id = ? OR (student_id IS NULL AND student_name = ?) ORDER BY visit_date DESC, visit_time DESC, id DESC LIMIT 100').all(own.id, own.name)
+    : db.prepare('SELECT * FROM uks_visits ORDER BY visit_date DESC, visit_time DESC, id DESC LIMIT 100').all();
   res.json(visits);
 });
 
 app.post('/api/uks/visits', (req, res) => {
-  const { student_id = null, student_name, class_name = '', visit_date, visit_time, complaint, action_taken = '', disposition = 'kembali_kelas', officer_name = 'Petugas UKS', parent_contacted = false } = req.body;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Kunjungan UKS dicatat oleh petugas sekolah.' });
+  const { student_id = null, student_name, class_name = '', visit_date, visit_time, complaint, action_taken = '', disposition = 'kembali_kelas', officer_name = 'Petugas UKS', parent_contacted = false } = req.body || {};
   const allowedDispositions = ['kembali_kelas', 'istirahat_uks', 'pulang_dengan_izin', 'rujukan'];
   const cleanName = String(student_name || '').trim();
   const cleanComplaint = String(complaint || '').trim();
@@ -1668,9 +2152,9 @@ app.post('/api/uks/visits', (req, res) => {
   if (cleanName.length > 100 || cleanComplaint.length > 1500) return res.status(400).json({ success: false, message: 'Catatan kunjungan melebihi batas yang diizinkan.' });
 
   const now = new Date();
-  const date = visit_date || now.toISOString().split('T')[0];
-  const time = visit_time || now.toTimeString().slice(0, 5);
-  const createdAt = now.toISOString().replace('T', ' ').substring(0, 19);
+  const date = visit_date || todayStr(now);
+  const time = visit_time || timeStr(now).slice(0, 5);
+  const createdAt = nowStamp(now);
   const result = db.prepare(`
     INSERT INTO uks_visits (student_id, student_name, class_name, visit_date, visit_time, complaint, action_taken, disposition, officer_name, parent_contacted, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1680,29 +2164,46 @@ app.post('/api/uks/visits', (req, res) => {
 });
 
 app.get('/api/uks/permissions', (req, res) => {
-  const permissions = db.prepare('SELECT * FROM student_permissions ORDER BY permission_date DESC, id DESC LIMIT 100').all();
+  const own = ownStudentFilter(req);
+  const permissions = own
+    ? db.prepare('SELECT * FROM student_permissions WHERE student_id = ? OR (student_id IS NULL AND student_name = ?) ORDER BY permission_date DESC, id DESC LIMIT 100').all(own.id, own.name)
+    : db.prepare('SELECT * FROM student_permissions ORDER BY permission_date DESC, id DESC LIMIT 100').all();
   res.json(permissions);
 });
 
 app.post('/api/uks/permissions', (req, res) => {
-  const { student_id = null, student_name, class_name = '', permission_date, permission_type = 'izin', reason, parent_name = '', parent_phone = '' } = req.body;
+  const body = { ...(req.body || {}) };
+  if (!isStaffRole(req.auth.role)) {
+    // Siswa/orang tua hanya bisa mengajukan izin untuk siswa yang terkait akunnya.
+    const profile = getSessionProfile(req.auth);
+    if (!profile?.student) return res.status(403).json({ success: false, message: 'Akun Anda belum terhubung dengan data siswa.' });
+    body.student_id = profile.student.id;
+    body.student_name = profile.student.name;
+    body.class_name = profile.student.class_name || '';
+    if (profile.role === 'ortu') {
+      body.parent_name = body.parent_name || profile.name;
+      body.parent_phone = body.parent_phone || profile.phone || '';
+    }
+  }
+  const { student_id = null, student_name, class_name = '', permission_date, permission_type = 'izin', reason, parent_name = '', parent_phone = '' } = body;
   const allowedTypes = ['sakit', 'izin', 'dispensasi'];
   const cleanName = String(student_name || '').trim();
   const cleanReason = String(reason || '').trim();
   if (!cleanName || !cleanReason) return res.status(400).json({ success: false, message: 'Nama siswa dan alasan izin wajib diisi.' });
   if (cleanName.length > 100 || cleanReason.length > 1500) return res.status(400).json({ success: false, message: 'Detail izin melebihi batas yang diizinkan.' });
   const now = new Date();
-  const createdAt = now.toISOString().replace('T', ' ').substring(0, 19);
+  const createdAt = nowStamp(now);
   const result = db.prepare(`
     INSERT INTO student_permissions (student_id, student_name, class_name, permission_date, permission_type, reason, parent_name, parent_phone, status, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'menunggu', ?)
-  `).run(Number(student_id) || null, cleanName, String(class_name).slice(0, 80), permission_date || now.toISOString().split('T')[0], allowedTypes.includes(permission_type) ? permission_type : 'izin', cleanReason, String(parent_name).slice(0, 100), String(parent_phone).slice(0, 40), createdAt);
+  `).run(Number(student_id) || null, cleanName, String(class_name).slice(0, 80), permission_date || todayStr(now), allowedTypes.includes(permission_type) ? permission_type : 'izin', cleanReason, String(parent_name).slice(0, 100), String(parent_phone).slice(0, 40), createdAt);
   const permission = db.prepare('SELECT * FROM student_permissions WHERE id = ?').get(result.lastInsertRowid);
   res.status(201).json({ success: true, permission, message: 'Permohonan izin berhasil diajukan.' });
 });
 
 app.patch('/api/uks/permissions/:id/status', (req, res) => {
-  const { status, reviewed_by = 'Petugas Sekolah' } = req.body;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya petugas sekolah yang dapat meninjau permohonan izin.' });
+  const { status, reviewed_by = getSessionProfile(req.auth)?.name || 'Petugas Sekolah' } = req.body || {};
   if (!['menunggu', 'disetujui', 'ditolak'].includes(status)) return res.status(400).json({ success: false, message: 'Status izin tidak valid.' });
   const result = db.prepare('UPDATE student_permissions SET status = ?, reviewed_by = ? WHERE id = ?').run(status, String(reviewed_by).slice(0, 100), req.params.id);
   if (!result.changes) return res.status(404).json({ success: false, message: 'Data izin tidak ditemukan.' });
@@ -1741,7 +2242,7 @@ app.post('/api/support/tickets', (req, res) => {
     return res.status(400).json({ success: false, message: 'Detail tiket melebihi batas panjang yang diizinkan.' });
   }
 
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const now = nowStamp();
   const ticketNumber = `TKT-${Date.now().toString().slice(-8)}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
   const result = db.prepare(`
     INSERT INTO support_tickets (ticket_number, requester_name, requester_role, category, subject, message, priority, status, created_at)
@@ -1765,26 +2266,37 @@ app.post('/api/support/tickets', (req, res) => {
 // ==========================================
 
 // Get user wallet (or auto-create one if not yet initialized)
-app.get('/api/wallet/my-wallet', (req, res) => {
-  const role = req.query.role || 'siswa';
-  const name = req.query.name || 'Aditya Pratama Putra';
-  const identifier = req.query.identifier || '0061234561';
-
-  let wallet = db.prepare('SELECT * FROM wallets WHERE holder_name = ? AND holder_role = ?').get(name, role);
-  if (!wallet) {
-    const cardNum = `CARD-${Date.now().toString().slice(-4)}-${Math.floor(1000 + Math.random() * 9000)}`;
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+// Dompet diidentifikasi dari sesi login (bukan parameter query) agar akun
+// tidak bisa membaca atau memakai dompet milik akun lain.
+function getSessionWallet(profile, { create = false } = {}) {
+  if (!profile) return null;
+  let wallet = profile.accountType === 'user'
+    ? db.prepare('SELECT * FROM wallets WHERE holder_role = ? AND (user_id = ? OR holder_name = ?) ORDER BY (user_id = ?) DESC, id ASC LIMIT 1').get(profile.role, profile.id, profile.name, profile.id)
+    : db.prepare('SELECT * FROM wallets WHERE holder_role = ? AND holder_name = ? ORDER BY id ASC LIMIT 1').get(profile.role, profile.name);
+  if (!wallet && create) {
+    const cardNum = `CARD-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
     const result = db.prepare(`
-      INSERT INTO wallets (card_number, holder_name, holder_role, holder_identifier, balance, status, created_at)
-      VALUES (?, ?, ?, ?, ?, 'aktif', ?)
-    `).run(cardNum, name, role, identifier, 50000, now);
+      INSERT INTO wallets (user_id, card_number, holder_name, holder_role, holder_identifier, balance, status, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, 'aktif', ?)
+    `).run(profile.accountType === 'user' ? profile.id : null, cardNum, profile.name, profile.role, profile.student?.nisn || profile.username, nowStamp());
     wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(result.lastInsertRowid);
   }
-  res.json({ success: true, wallet });
+  return wallet;
+}
+
+app.get('/api/wallet/my-wallet', (req, res) => {
+  const profile = getSessionProfile(req.auth);
+  if (!profile) return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: 'Sesi tidak lagi valid.' });
+  const { pin, ...wallet } = getSessionWallet(profile, { create: true });
+  res.json({ success: true, wallet, holder: { name: profile.name, role: profile.role, identifier: wallet.holder_identifier } });
 });
 
 // Get transactions for a wallet
 app.get('/api/wallet/transactions/:walletId', (req, res) => {
+  if (!isStaffRole(req.auth.role)) {
+    const own = getSessionWallet(getSessionProfile(req.auth));
+    if (!own || own.id !== Number(req.params.walletId)) return res.status(403).json({ success: false, message: 'Anda hanya dapat melihat mutasi dompet milik sendiri.' });
+  }
   const txs = db.prepare(`
     SELECT * FROM wallet_transactions 
     WHERE wallet_id = ? 
@@ -1806,8 +2318,14 @@ app.post('/api/wallet/topup', (req, res) => {
   if (!wallet) {
     return res.status(404).json({ success: false, message: 'Dompet tidak ditemukan' });
   }
+  if (!isStaffRole(req.auth.role)) {
+    const own = getSessionWallet(getSessionProfile(req.auth));
+    if (!own || own.id !== wallet.id) return res.status(403).json({ success: false, message: 'Anda hanya dapat mengisi saldo dompet milik sendiri.' });
+  }
+  if (wallet.status !== 'aktif') return res.status(400).json({ success: false, message: 'Dompet ini sedang dibekukan/nonaktif.' });
+  if (numAmount < 1000 || numAmount > 5000000) return res.status(400).json({ success: false, message: 'Nominal top-up minimal Rp 1.000 dan maksimal Rp 5.000.000.' });
 
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const now = nowStamp();
   const txCode = `TX-TOPUP-${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
   const ref = reference_number || `${(method || 'QRIS').toUpperCase()}-${Date.now().toString().slice(-6)}`;
   
@@ -1817,14 +2335,13 @@ app.post('/api/wallet/topup', (req, res) => {
 
   const desc = `Top-Up Saldo Dompet via ${methodLabel}`;
 
-  // Update balance
-  db.prepare('UPDATE wallets SET balance = balance + ? WHERE id = ?').run(numAmount, wallet_id);
-
-  // Insert transaction
-  db.prepare(`
-    INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
-    VALUES (?, ?, 'topup', ?, 0, ?, ?, 'success', ?, ?)
-  `).run(wallet_id, txCode, numAmount, desc, method || 'qris', ref, now);
+  transaction(() => {
+    db.prepare('UPDATE wallets SET balance = balance + ? WHERE id = ?').run(numAmount, wallet.id);
+    db.prepare(`
+      INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
+      VALUES (?, ?, 'topup', ?, 0, ?, ?, 'success', ?, ?)
+    `).run(wallet.id, txCode, numAmount, desc, method || 'qris', ref, now);
+  });
 
   const updatedWallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet_id);
   res.json({
@@ -1844,6 +2361,11 @@ app.post('/api/wallet/transfer', (req, res) => {
 
   const sender = db.prepare('SELECT * FROM wallets WHERE id = ?').get(sender_wallet_id);
   if (!sender) return res.status(404).json({ success: false, message: 'Dompet pengirim tidak ditemukan' });
+  if (!isStaffRole(req.auth.role)) {
+    const own = getSessionWallet(getSessionProfile(req.auth));
+    if (!own || own.id !== sender.id) return res.status(403).json({ success: false, message: 'Anda hanya dapat mentransfer dari dompet milik sendiri.' });
+  }
+  if (sender.status !== 'aktif') return res.status(400).json({ success: false, message: 'Dompet pengirim sedang dibekukan/nonaktif.' });
   if (sender.balance < numAmount) {
     return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi untuk melakukan transfer' });
   }
@@ -1856,23 +2378,28 @@ app.post('/api/wallet/transfer', (req, res) => {
     return res.status(400).json({ success: false, message: 'Tidak dapat transfer ke kartu sendiri' });
   }
 
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const txCodeOut = `TX-TRF-OUT-${Date.now().toString().slice(-6)}`;
-  const txCodeIn = `TX-TRF-IN-${Date.now().toString().slice(-6)}`;
+  const now = nowStamp();
+  const stamp = `${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
+  const txCodeOut = `TX-TRF-OUT-${stamp}`;
+  const txCodeIn = `TX-TRF-IN-${stamp}`;
+  const cleanNotes = cleanText(notes, 200);
 
-  // Deduct sender
-  db.prepare('UPDATE wallets SET balance = balance - ? WHERE id = ?').run(numAmount, sender.id);
-  db.prepare(`
-    INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
-    VALUES (?, ?, 'transfer_out', ?, 0, ?, 'transfer', 'success', ?, ?)
-  `).run(sender.id, txCodeOut, numAmount, `Transfer saldo ke ${target.holder_name} (${target.card_number})${notes ? ': ' + notes : ''}`, target.card_number, now);
-
-  // Credit target
-  db.prepare('UPDATE wallets SET balance = balance + ? WHERE id = ?').run(numAmount, target.id);
-  db.prepare(`
-    INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
-    VALUES (?, ?, 'transfer_in', ?, 0, ?, 'transfer', 'success', ?, ?)
-  `).run(target.id, txCodeIn, numAmount, `Terima saldo dari ${sender.holder_name} (${sender.card_number})${notes ? ': ' + notes : ''}`, sender.card_number, now);
+  const transferred = transaction(() => {
+    // Saldo diperiksa ulang di dalam transaksi agar dua transfer bersamaan tidak membuat saldo negatif.
+    const debit = db.prepare('UPDATE wallets SET balance = balance - ? WHERE id = ? AND balance >= ?').run(numAmount, sender.id, numAmount);
+    if (!debit.changes) return false;
+    db.prepare(`
+      INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
+      VALUES (?, ?, 'transfer_out', ?, 0, ?, 'transfer', 'success', ?, ?)
+    `).run(sender.id, txCodeOut, numAmount, `Transfer saldo ke ${target.holder_name} (${target.card_number})${cleanNotes ? ': ' + cleanNotes : ''}`, target.card_number, now);
+    db.prepare('UPDATE wallets SET balance = balance + ? WHERE id = ?').run(numAmount, target.id);
+    db.prepare(`
+      INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
+      VALUES (?, ?, 'transfer_in', ?, 0, ?, 'transfer', 'success', ?, ?)
+    `).run(target.id, txCodeIn, numAmount, `Terima saldo dari ${sender.holder_name} (${sender.card_number})${cleanNotes ? ': ' + cleanNotes : ''}`, sender.card_number, now);
+    return true;
+  });
+  if (!transferred) return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi untuk melakukan transfer' });
 
   const updatedSender = db.prepare('SELECT * FROM wallets WHERE id = ?').get(sender.id);
   res.json({
@@ -1884,7 +2411,8 @@ app.post('/api/wallet/transfer', (req, res) => {
 
 // Admin list all wallets
 app.get('/api/wallet/all', (req, res) => {
-  const wallets = db.prepare('SELECT * FROM wallets ORDER BY balance DESC').all();
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Monitoring seluruh dompet hanya untuk staf sekolah.' });
+  const wallets = db.prepare('SELECT id, user_id, card_number, holder_name, holder_role, holder_identifier, balance, status, created_at FROM wallets ORDER BY balance DESC').all();
   const summary = db.prepare(`
     SELECT 
       COUNT(*) as total_cards,
@@ -1913,11 +2441,14 @@ app.get('/api/canteen/products', (req, res) => {
 
 // Create product (Admin / Kasir Kantin)
 app.post('/api/canteen/products', (req, res) => {
-  const { name, category, price, stock, image_url, description, stand_name, digital_type } = req.body;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya kasir/staf yang dapat mengelola produk kantin.' });
+  const { name, category, price, stock, image_url, description, stand_name, digital_type } = req.body || {};
   if (!name || !price || !category) {
     return res.status(400).json({ success: false, message: 'Nama, kategori, dan harga produk wajib diisi' });
   }
-  const now = new Date().toISOString().split('T')[0];
+  if (!['makanan', 'minuman', 'digital', 'koperasi'].includes(category)) return res.status(400).json({ success: false, message: 'Kategori produk tidak dikenal.' });
+  if (!(Number(price) > 0)) return res.status(400).json({ success: false, message: 'Harga produk harus lebih dari 0.' });
+  const now = todayStr();
   const result = db.prepare(`
     INSERT INTO canteen_products (name, category, price, stock, image_url, description, stand_name, is_available, digital_type, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
@@ -1936,39 +2467,57 @@ app.post('/api/canteen/products', (req, res) => {
   res.json({ success: true, message: 'Produk berhasil ditambahkan ke kantin', product: newProd });
 });
 
-// Update product
+// Update product (pembaruan parsial: field yang tidak dikirim mempertahankan nilai lama)
 app.put('/api/canteen/products/:id', (req, res) => {
-  const { name, category, price, stock, image_url, description, stand_name, is_available, digital_type } = req.body;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya kasir/staf yang dapat mengelola produk kantin.' });
+  const existing = db.prepare('SELECT * FROM canteen_products WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ success: false, message: 'Produk tidak ditemukan.' });
+  const body = req.body || {};
+  const name = cleanText(body.name ?? existing.name, 150);
+  const category = body.category === undefined ? existing.category : body.category;
+  const price = body.price === undefined ? existing.price : toNumber(body.price, -1);
+  const stock = body.stock === undefined ? existing.stock : toNumber(body.stock, -1);
+  if (!name) return res.status(400).json({ success: false, message: 'Nama produk wajib diisi.' });
+  if (!['makanan', 'minuman', 'digital', 'koperasi'].includes(category)) return res.status(400).json({ success: false, message: 'Kategori produk tidak dikenal.' });
+  if (price <= 0) return res.status(400).json({ success: false, message: 'Harga produk harus lebih dari 0.' });
+  if (stock < 0) return res.status(400).json({ success: false, message: 'Stok tidak boleh negatif.' });
   db.prepare(`
-    UPDATE canteen_products 
+    UPDATE canteen_products
     SET name = ?, category = ?, price = ?, stock = ?, image_url = ?, description = ?, stand_name = ?, is_available = ?, digital_type = ?
     WHERE id = ?
   `).run(
     name,
     category,
-    Number(price),
-    Number(stock),
-    image_url,
-    description,
-    stand_name,
-    is_available ? 1 : 0,
-    digital_type || null,
-    req.params.id
+    Math.round(price),
+    Math.round(stock),
+    body.image_url === undefined ? existing.image_url : (cleanText(body.image_url, 1000) || existing.image_url),
+    body.description === undefined ? existing.description : cleanText(body.description, 1000),
+    body.stand_name === undefined ? existing.stand_name : (cleanText(body.stand_name, 120) || existing.stand_name),
+    body.is_available === undefined ? existing.is_available : (body.is_available ? 1 : 0),
+    body.digital_type === undefined ? existing.digital_type : (cleanText(body.digital_type, 60) || null),
+    existing.id
   );
-  res.json({ success: true, message: 'Produk kantin berhasil diperbarui' });
+  const product = db.prepare('SELECT * FROM canteen_products WHERE id = ?').get(existing.id);
+  res.json({ success: true, product, message: 'Produk kantin berhasil diperbarui' });
 });
 
 // Delete product
 app.delete('/api/canteen/products/:id', (req, res) => {
-  db.prepare('DELETE FROM canteen_products WHERE id = ?').run(req.params.id);
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya kasir/staf yang dapat mengelola produk kantin.' });
+  const result = db.prepare('DELETE FROM canteen_products WHERE id = ?').run(req.params.id);
+  if (!result.changes) return res.status(404).json({ success: false, message: 'Produk tidak ditemukan.' });
   res.json({ success: true, message: 'Produk berhasil dihapus' });
 });
 
 // Get orders
 app.get('/api/canteen/orders', (req, res) => {
-  const buyer_name = req.query.buyer_name;
+  const buyer_name = cleanText(req.query.buyer_name, 120);
   let orders;
-  if (buyer_name) {
+  if (!isStaffRole(req.auth.role)) {
+    // Siswa/orang tua hanya melihat pesanan miliknya sendiri.
+    const profile = getSessionProfile(req.auth);
+    orders = db.prepare('SELECT * FROM canteen_orders WHERE buyer_name = ? AND buyer_role = ? ORDER BY id DESC LIMIT 50').all(profile?.name || '', req.auth.role);
+  } else if (buyer_name) {
     orders = db.prepare('SELECT * FROM canteen_orders WHERE buyer_name = ? ORDER BY id DESC LIMIT 50').all(buyer_name);
   } else {
     orders = db.prepare('SELECT * FROM canteen_orders ORDER BY id DESC LIMIT 100').all();
@@ -1985,103 +2534,98 @@ app.get('/api/canteen/orders', (req, res) => {
 
 // Place Order
 app.post('/api/canteen/order', (req, res) => {
-  const { 
-    buyer_name, 
-    buyer_role, 
-    buyer_identifier, 
-    items, 
-    payment_method, 
-    pickup_time, 
-    notes, 
-    digital_target 
-  } = req.body;
+  const profile = getSessionProfile(req.auth);
+  if (!profile) return res.status(401).json({ success: false, code: 'SESSION_INVALID', message: 'Sesi tidak lagi valid.' });
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  const paymentMethod = ['wallet', 'qris', 'cash'].includes(req.body?.payment_method) ? req.body.payment_method : null;
+  const staffOverride = isStaffRole(req.auth.role);
+  const buyerName = (staffOverride && cleanText(req.body?.buyer_name, 120)) || profile.name;
+  const buyerRole = (staffOverride && cleanText(req.body?.buyer_role, 30)) || profile.role;
+  const buyerIdentifier = cleanText(req.body?.buyer_identifier, 60) || profile.student?.nisn || profile.username;
+  const pickupTime = cleanText(req.body?.pickup_time, 60) || 'Istirahat 1 (09.30)';
+  const notes = cleanText(req.body?.notes, 300);
+  const digitalTarget = cleanText(req.body?.digital_target, 80) || null;
 
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ success: false, message: 'Keranjang belanja kosong' });
+  if (!items.length) return res.status(400).json({ success: false, message: 'Keranjang belanja kosong' });
+  if (!paymentMethod) return res.status(400).json({ success: false, message: 'Metode pembayaran tidak valid (wallet, qris, atau cash).' });
+
+  // Harga & stok diambil ulang dari database agar tidak bisa dimanipulasi dari sisi klien.
+  const normalizedItems = [];
+  for (const item of items) {
+    const quantity = Math.max(1, Math.round(toNumber(item?.quantity, 1)));
+    const productId = toNumber(item?.id);
+    const product = productId ? db.prepare('SELECT * FROM canteen_products WHERE id = ?').get(productId) : null;
+    if (!product) return res.status(400).json({ success: false, message: `Produk "${cleanText(item?.name, 60) || 'tidak dikenal'}" tidak ditemukan di katalog kantin.` });
+    if (!product.is_available) return res.status(400).json({ success: false, message: `Produk "${product.name}" sedang tidak tersedia.` });
+    if (product.category !== 'digital' && product.stock < quantity) return res.status(400).json({ success: false, message: `Stok "${product.name}" hanya tersisa ${product.stock}.` });
+    normalizedItems.push({ id: product.id, name: product.name, price: product.price, quantity, category: product.category, digital_type: product.digital_type || null, stand_name: product.stand_name });
   }
-
-  const totalAmount = items.reduce((acc, it) => acc + (Number(it.price) * Number(it.quantity || 1)), 0);
-  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const orderNumber = `KNT-${Date.now().toString().slice(-4)}-${Math.floor(1000 + Math.random() * 9000)}`;
-
-  let serialNumber = null;
-  const hasDigital = items.some(it => it.category === 'digital');
-  if (hasDigital) {
-    serialNumber = `${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}-${Math.floor(1000 + Math.random() * 9000)}`;
-  }
+  const hasDigital = normalizedItems.some((item) => item.category === 'digital');
+  const totalAmount = normalizedItems.reduce((acc, item) => acc + item.price * item.quantity, 0);
+  const now = nowStamp();
+  const orderNumber = `KNT-${Date.now().toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const serialNumber = hasDigital ? Array.from({ length: 4 }, () => Math.floor(1000 + Math.random() * 9000)).join('-') : null;
 
   let wallet = null;
-  if (payment_method === 'wallet') {
-    wallet = db.prepare('SELECT * FROM wallets WHERE holder_name = ? AND holder_role = ?').get(buyer_name, buyer_role);
-    if (!wallet) {
-      return res.status(400).json({ success: false, message: 'Dompet digital Anda belum aktif. Silakan buka menu Dompet Digital.' });
-    }
+  if (paymentMethod === 'wallet') {
+    wallet = getSessionWallet(profile);
+    if (!wallet) return res.status(400).json({ success: false, message: 'Dompet digital Anda belum aktif. Silakan buka menu Dompet Digital.' });
+    if (wallet.status !== 'aktif') return res.status(400).json({ success: false, message: 'Dompet digital Anda sedang dibekukan/nonaktif.' });
     if (wallet.balance < totalAmount) {
-      return res.status(400).json({ 
-        success: false, 
-        message: `Saldo tidak cukup! Saldo Anda: Rp ${wallet.balance.toLocaleString('id-ID')}, Total pesanan: Rp ${totalAmount.toLocaleString('id-ID')}. Silakan isi saldo terlebih dahulu.` 
+      return res.status(400).json({
+        success: false,
+        message: `Saldo tidak cukup! Saldo Anda: Rp ${wallet.balance.toLocaleString('id-ID')}, Total pesanan: Rp ${totalAmount.toLocaleString('id-ID')}. Silakan isi saldo terlebih dahulu.`
       });
     }
-
-    // Deduct balance
-    db.prepare('UPDATE wallets SET balance = balance - ? WHERE id = ?').run(totalAmount, wallet.id);
-
-    // Record wallet transaction
-    const txType = hasDigital ? 'payment_digital' : 'payment_canteen';
-    const txCode = `TX-PAY-${Date.now().toString().slice(-6)}`;
-    const txDesc = `Pembayaran Pesanan Kantin #${orderNumber} (${items.length} item)`;
-    db.prepare(`
-      INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
-      VALUES (?, ?, ?, ?, 0, ?, 'wallet_deduct', 'success', ?, ?)
-    `).run(wallet.id, txCode, txType, totalAmount, txDesc, orderNumber, now);
-
-    wallet = db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id);
   }
 
-  // Reduce product stock
-  for (const item of items) {
-    if (item.id) {
-      db.prepare('UPDATE canteen_products SET stock = MAX(0, stock - ?) WHERE id = ?').run(item.quantity || 1, item.id);
-    }
+  try {
+    const orderId = transaction(() => {
+      if (wallet) {
+        const debit = db.prepare('UPDATE wallets SET balance = balance - ? WHERE id = ? AND balance >= ?').run(totalAmount, wallet.id, totalAmount);
+        if (!debit.changes) throw Object.assign(new Error('Saldo dompet tidak mencukupi.'), { httpStatus: 400 });
+        db.prepare(`
+          INSERT INTO wallet_transactions (wallet_id, transaction_code, type, amount, fee, description, method, status, reference_number, created_at)
+          VALUES (?, ?, ?, ?, 0, ?, 'wallet_deduct', 'success', ?, ?)
+        `).run(wallet.id, `TX-PAY-${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`, hasDigital ? 'payment_digital' : 'payment_canteen', totalAmount, `Pembayaran Pesanan Kantin #${orderNumber} (${normalizedItems.length} item)`, orderNumber, now);
+      }
+      for (const item of normalizedItems) {
+        if (item.category !== 'digital') {
+          const updated = db.prepare('UPDATE canteen_products SET stock = stock - ? WHERE id = ? AND stock >= ?').run(item.quantity, item.id, item.quantity);
+          if (!updated.changes) throw Object.assign(new Error(`Stok "${item.name}" tidak mencukupi.`), { httpStatus: 400 });
+        }
+      }
+      const result = db.prepare(`
+        INSERT INTO canteen_orders (order_number, buyer_name, buyer_role, buyer_identifier, total_amount, payment_method, payment_status, order_status, pickup_time, notes, digital_target, serial_number, items_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(orderNumber, buyerName, buyerRole, buyerIdentifier, totalAmount, paymentMethod, paymentMethod === 'cash' ? 'pending' : 'paid', hasDigital ? 'selesai' : 'diproses', pickupTime, notes, digitalTarget, serialNumber, JSON.stringify(normalizedItems), now);
+      return result.lastInsertRowid;
+    });
+
+    const newOrder = db.prepare('SELECT * FROM canteen_orders WHERE id = ?').get(orderId);
+    const updatedWallet = wallet ? db.prepare('SELECT * FROM wallets WHERE id = ?').get(wallet.id) : null;
+    res.status(201).json({
+      success: true,
+      message: hasDigital
+        ? `Pembelian produk digital berhasil! Kode Token/SN: ${serialNumber}`
+        : `Pesanan #${orderNumber} berhasil dibuat! Tunjukkan struk ke penjaga stand kantin.`,
+      order: { ...newOrder, items: normalizedItems },
+      wallet: updatedWallet,
+      new_balance: updatedWallet ? updatedWallet.balance : null
+    });
+  } catch (err) {
+    if (err.httpStatus) return res.status(err.httpStatus).json({ success: false, message: err.message });
+    sendError(res, err, 'Gagal memproses pesanan kantin');
   }
-
-  const initialStatus = hasDigital ? 'selesai' : 'diproses';
-  const paymentStatus = payment_method === 'cash' ? 'pending' : 'paid';
-
-  const result = db.prepare(`
-    INSERT INTO canteen_orders (order_number, buyer_name, buyer_role, buyer_identifier, total_amount, payment_method, payment_status, order_status, pickup_time, notes, digital_target, serial_number, items_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    orderNumber,
-    buyer_name,
-    buyer_role,
-    buyer_identifier || '',
-    totalAmount,
-    payment_method,
-    paymentStatus,
-    initialStatus,
-    pickup_time || 'Istirahat 1 (09.30)',
-    notes || '',
-    digital_target || null,
-    serialNumber,
-    JSON.stringify(items),
-    now
-  );
-
-  const newOrder = db.prepare('SELECT * FROM canteen_orders WHERE id = ?').get(result.lastInsertRowid);
-  res.json({
-    success: true,
-    message: hasDigital 
-      ? `Pembelian produk digital berhasil! Kode Token/SN: ${serialNumber}`
-      : `Pesanan #${orderNumber} berhasil dibuat! Tunjukkan struk ke penjaga stand kantin.`,
-    order: { ...newOrder, items },
-    new_balance: wallet ? wallet.balance : null
-  });
 });
 
 // Update order status (Admin / Kasir Kantin)
 app.put('/api/canteen/orders/:id/status', (req, res) => {
-  const { order_status, payment_status } = req.body;
+  if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya kasir/staf yang dapat mengubah status pesanan.' });
+  const { order_status, payment_status } = req.body || {};
+  if (order_status && !['diproses', 'siap_diambil', 'selesai', 'dibatalkan'].includes(order_status)) return res.status(400).json({ success: false, message: 'Status pesanan tidak valid.' });
+  if (payment_status && !['paid', 'pending', 'cancelled'].includes(payment_status)) return res.status(400).json({ success: false, message: 'Status pembayaran tidak valid.' });
+  if (!db.prepare('SELECT id FROM canteen_orders WHERE id = ?').get(req.params.id)) return res.status(404).json({ success: false, message: 'Pesanan tidak ditemukan.' });
   if (order_status && payment_status) {
     db.prepare('UPDATE canteen_orders SET order_status = ?, payment_status = ? WHERE id = ?').run(order_status, payment_status, req.params.id);
   } else if (order_status) {
@@ -2115,7 +2659,7 @@ app.get('/api/pemilos/stats', (req, res) => {
       turnoutPct
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat statistik Pemilos: ' + err.message });
+    sendError(res, err, 'Gagal memuat statistik Pemilos');
   }
 });
 
@@ -2124,7 +2668,7 @@ app.get('/api/pemilos/candidates', (req, res) => {
     const candidates = db.prepare('SELECT * FROM pemilos_candidates ORDER BY candidate_number ASC').all();
     res.json(candidates);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat daftar calon: ' + err.message });
+    sendError(res, err, 'Gagal memuat daftar calon');
   }
 });
 
@@ -2141,7 +2685,7 @@ app.post('/api/pemilos/candidates', (req, res) => {
       candNum = maxNum + 1;
     }
 
-    const now = new Date().toISOString().split('T')[0];
+    const now = todayStr();
     const stmt = db.prepare(`
       INSERT INTO pemilos_candidates (candidate_number, pair_names, vision, mission, photo_url, vote_count, created_at)
       VALUES (?, ?, ?, ?, ?, 0, ?)
@@ -2150,7 +2694,7 @@ app.post('/api/pemilos/candidates', (req, res) => {
     const newCand = db.prepare('SELECT * FROM pemilos_candidates WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ success: true, candidate: newCand, message: `Paslon No. ${candNum} (${pair_names}) berhasil didaftarkan!` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan paslon: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan paslon');
   }
 });
 
@@ -2177,18 +2721,21 @@ app.put('/api/pemilos/candidates/:id', (req, res) => {
     const updated = db.prepare('SELECT * FROM pemilos_candidates WHERE id = ?').get(req.params.id);
     res.json({ success: true, candidate: updated, message: `Data Paslon No. ${finalNumber} (${finalNames}) berhasil diperbarui!` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui paslon: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui paslon');
   }
 });
 
 app.delete('/api/pemilos/candidates/:id', (req, res) => {
   try {
     const candId = Number(req.params.id);
-    db.prepare('UPDATE pemilos_voters SET has_voted = 0, voted_candidate_id = null WHERE voted_candidate_id = ?').run(candId);
-    db.prepare('DELETE FROM pemilos_candidates WHERE id = ?').run(candId);
+    const removed = transaction(() => {
+      db.prepare('UPDATE pemilos_voters SET has_voted = 0, voted_candidate_id = null, voted_at = null WHERE voted_candidate_id = ?').run(candId);
+      return db.prepare('DELETE FROM pemilos_candidates WHERE id = ?').run(candId).changes;
+    });
+    if (!removed) return res.status(404).json({ success: false, message: 'Pasangan calon tidak ditemukan' });
     res.json({ success: true, message: 'Pasangan calon berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus paslon: ' + err.message });
+    sendError(res, err, 'Gagal menghapus paslon');
   }
 });
 
@@ -2222,7 +2769,7 @@ app.get('/api/pemilos/voters', (req, res) => {
     const voters = db.prepare(query).all(...params);
     res.json(voters);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat DPT: ' + err.message });
+    sendError(res, err, 'Gagal memuat DPT');
   }
 });
 
@@ -2240,7 +2787,7 @@ app.post('/api/pemilos/voters', (req, res) => {
     const result = stmt.run(voter_id.trim(), voter_name.trim(), class_name.trim(), voter_role);
     res.status(201).json({ success: true, voterId: result.lastInsertRowid, message: 'Pemilih berhasil ditambahkan ke DPT' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan DPT: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan DPT');
   }
 });
 
@@ -2251,7 +2798,7 @@ app.put('/api/pemilos/voters/:id/presence', (req, res) => {
     db.prepare('UPDATE pemilos_voters SET is_present = ? WHERE id = ?').run(newVal, req.params.id);
     res.json({ success: true, is_present: newVal, message: newVal ? 'Presensi kehadiran pemilih di TPS tercatat!' : 'Presensi pemilih dibatalkan.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengubah status presensi: ' + err.message });
+    sendError(res, err, 'Gagal mengubah status presensi');
   }
 });
 
@@ -2293,11 +2840,18 @@ app.post('/api/pemilos/vote', (req, res) => {
       return res.status(404).json({ success: false, message: 'Kandidat pasangan calon tidak ditemukan!' });
     }
 
-    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const now = nowStamp();
     
-    // Transaksi pemungutan suara
-    db.prepare('UPDATE pemilos_candidates SET vote_count = vote_count + 1 WHERE id = ?').run(candidate.id);
-    db.prepare('UPDATE pemilos_voters SET has_voted = 1, voted_candidate_id = ?, voted_at = ? WHERE id = ?').run(candidate.id, now, voter.id);
+    // Transaksi pemungutan suara (atomik; suara ganda ditolak di level database)
+    const recorded = transaction(() => {
+      const marked = db.prepare('UPDATE pemilos_voters SET has_voted = 1, voted_candidate_id = ?, voted_at = ? WHERE id = ? AND has_voted = 0').run(candidate.id, now, voter.id);
+      if (!marked.changes) return false;
+      db.prepare('UPDATE pemilos_candidates SET vote_count = vote_count + 1 WHERE id = ?').run(candidate.id);
+      return true;
+    });
+    if (!recorded) {
+      return res.status(400).json({ success: false, message: 'Hak suara Anda sudah digunakan sebelumnya! Sistem menolak pemungutan suara ganda.' });
+    }
 
     const tokenReceipt = `KPOS-${Date.now().toString().slice(-4)}-${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -2313,7 +2867,7 @@ app.post('/api/pemilos/vote', (req, res) => {
       message: `Terima kasih! Suara Anda untuk Paslon No. ${candidate.candidate_number} (${candidate.pair_names}) telah sah dicatat.`
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal melakukan pemungutan suara: ' + err.message });
+    sendError(res, err, 'Gagal melakukan pemungutan suara');
   }
 });
 
@@ -2322,14 +2876,16 @@ app.post('/api/pemilos/voters/:id/reset', (req, res) => {
     const voter = db.prepare('SELECT * FROM pemilos_voters WHERE id = ?').get(req.params.id);
     if (!voter) return res.status(404).json({ success: false, message: 'Pemilih tidak ditemukan' });
 
-    if (voter.has_voted && voter.voted_candidate_id) {
-      db.prepare('UPDATE pemilos_candidates SET vote_count = MAX(0, vote_count - 1) WHERE id = ?').run(voter.voted_candidate_id);
-    }
-    db.prepare('UPDATE pemilos_voters SET has_voted = 0, voted_candidate_id = null, voted_at = null WHERE id = ?').run(req.params.id);
+    transaction(() => {
+      if (voter.has_voted && voter.voted_candidate_id) {
+        db.prepare('UPDATE pemilos_candidates SET vote_count = MAX(0, vote_count - 1) WHERE id = ?').run(voter.voted_candidate_id);
+      }
+      db.prepare('UPDATE pemilos_voters SET has_voted = 0, voted_candidate_id = null, voted_at = null WHERE id = ?').run(voter.id);
+    });
 
     res.json({ success: true, message: `Hak suara pemilih ${voter.voter_name} berhasil direset` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mereset suara: ' + err.message });
+    sendError(res, err, 'Gagal mereset suara');
   }
 });
 
@@ -2339,7 +2895,7 @@ app.post('/api/pemilos/reset-all', (req, res) => {
     db.prepare('UPDATE pemilos_voters SET has_voted = 0, voted_candidate_id = null, voted_at = null, is_present = 0').run();
     res.json({ success: true, message: 'Seluruh data suara dan presensi pemilu berhasil direset untuk simulasi baru' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mereset pemilu: ' + err.message });
+    sendError(res, err, 'Gagal mereset pemilu');
   }
 });
 
@@ -2348,7 +2904,7 @@ app.get('/api/pemilos/supervisors', (req, res) => {
     const sups = db.prepare('SELECT * FROM pemilos_supervisors ORDER BY id ASC').all();
     res.json(sups);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat pengawas: ' + err.message });
+    sendError(res, err, 'Gagal memuat pengawas');
   }
 });
 
@@ -2364,7 +2920,7 @@ app.get('/api/walikelas/dashboard', (req, res) => {
     const maleStudents = db.prepare("SELECT count(*) as count FROM walikelas_students WHERE gender = 'L'").get().count;
     const femaleStudents = db.prepare("SELECT count(*) as count FROM walikelas_students WHERE gender = 'P'").get().count;
 
-    const today = new Date().toISOString().split('T')[0];
+    const today = todayStr();
     const todayAttRows = db.prepare('SELECT status, count(*) as count FROM walikelas_attendance WHERE date = ? GROUP BY status').all(today);
     const attMap = { Hadir: 0, Sakit: 0, Izin: 0, Alpa: 0 };
     todayAttRows.forEach(r => { attMap[r.status] = r.count; });
@@ -2410,7 +2966,7 @@ app.get('/api/walikelas/dashboard', (req, res) => {
       recentCases
     });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat dashboard wali kelas: ' + err.message });
+    sendError(res, err, 'Gagal memuat dashboard wali kelas');
   }
 });
 
@@ -2420,7 +2976,7 @@ app.get('/api/walikelas/info', (req, res) => {
     const info = db.prepare('SELECT * FROM walikelas_info LIMIT 1').get();
     res.json(info);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat info kelas: ' + err.message });
+    sendError(res, err, 'Gagal memuat info kelas');
   }
 });
 
@@ -2435,7 +2991,7 @@ app.put('/api/walikelas/info', (req, res) => {
     const updated = db.prepare('SELECT * FROM walikelas_info WHERE id = 1').get();
     res.json({ success: true, info: updated, message: 'Profil dan pengaturan kelas berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui info kelas: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui info kelas');
   }
 });
 
@@ -2445,7 +3001,7 @@ app.get('/api/walikelas/students', (req, res) => {
     const students = db.prepare('SELECT * FROM walikelas_students ORDER BY name ASC').all();
     res.json(students);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat data siswa: ' + err.message });
+    sendError(res, err, 'Gagal memuat data siswa');
   }
 });
 
@@ -2463,22 +3019,30 @@ app.post('/api/walikelas/students', (req, res) => {
     const newStudent = db.prepare('SELECT * FROM walikelas_students WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ success: true, student: newStudent, message: 'Siswa berhasil ditambahkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan siswa: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan siswa');
   }
 });
 
 app.put('/api/walikelas/students/:id', (req, res) => {
   try {
-    const { nis, nisn, name, gender, phone_parent, phone_student, address, blood_type, birth_date, status, notes, avatar } = req.body;
+    const existing = db.prepare('SELECT * FROM walikelas_students WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Siswa tidak ditemukan.' });
+    const body = req.body || {};
+    // Pembaruan parsial: field yang tidak dikirim mempertahankan nilai lama.
+    const pick = (key, max = 200) => (body[key] === undefined ? existing[key] : (cleanText(body[key], max) || null));
+    const nis = cleanText(body.nis ?? existing.nis, 20);
+    const name = cleanText(body.name ?? existing.name, 120);
+    if (!nis || !name) return res.status(400).json({ success: false, message: 'NIS dan nama siswa wajib diisi.' });
+    const gender = ['L', 'P'].includes(body.gender) ? body.gender : existing.gender;
     db.prepare(`
       UPDATE walikelas_students
       SET nis = ?, nisn = ?, name = ?, gender = ?, phone_parent = ?, phone_student = ?, address = ?, blood_type = ?, birth_date = ?, status = ?, notes = ?, avatar = ?
       WHERE id = ?
-    `).run(nis, nisn, name, gender, phone_parent, phone_student, address, blood_type, birth_date, status || 'aktif', notes, avatar, req.params.id);
+    `).run(nis, pick('nisn', 20), name, gender, pick('phone_parent', 30), pick('phone_student', 30), pick('address', 300), pick('blood_type', 5) || 'O', pick('birth_date', 20), cleanText(body.status ?? existing.status, 20) || 'aktif', pick('notes', 1000), pick('avatar', 1000), existing.id);
     const updated = db.prepare('SELECT * FROM walikelas_students WHERE id = ?').get(req.params.id);
     res.json({ success: true, student: updated, message: 'Biodata siswa berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui siswa: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui siswa');
   }
 });
 
@@ -2487,7 +3051,7 @@ app.delete('/api/walikelas/students/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_students WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Siswa berhasil dihapus dari rombel' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus siswa: ' + err.message });
+    sendError(res, err, 'Gagal menghapus siswa');
   }
 });
 
@@ -2497,7 +3061,7 @@ app.get('/api/walikelas/officers', (req, res) => {
     const officers = db.prepare('SELECT * FROM walikelas_officers ORDER BY id ASC').all();
     res.json(officers);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat pengurus kelas: ' + err.message });
+    sendError(res, err, 'Gagal memuat pengurus kelas');
   }
 });
 
@@ -2512,7 +3076,7 @@ app.post('/api/walikelas/officers', (req, res) => {
     const newOfficer = db.prepare('SELECT * FROM walikelas_officers WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ success: true, officer: newOfficer, message: 'Pengurus kelas berhasil ditambahkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan pengurus: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan pengurus');
   }
 });
 
@@ -2526,7 +3090,7 @@ app.put('/api/walikelas/officers/:id', (req, res) => {
     `).run(position_title, student_name, phone, tasks, avatar, req.params.id);
     res.json({ success: true, message: 'Data pengurus kelas berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui pengurus: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui pengurus');
   }
 });
 
@@ -2535,7 +3099,7 @@ app.delete('/api/walikelas/officers/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_officers WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Pengurus kelas berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus pengurus: ' + err.message });
+    sendError(res, err, 'Gagal menghapus pengurus');
   }
 });
 
@@ -2550,7 +3114,7 @@ app.get('/api/walikelas/piket', (req, res) => {
     }));
     res.json(formatted);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat jadwal piket: ' + err.message });
+    sendError(res, err, 'Gagal memuat jadwal piket');
   }
 });
 
@@ -2564,7 +3128,7 @@ app.put('/api/walikelas/piket/:id', (req, res) => {
     `).run(JSON.stringify(members || []), JSON.stringify(duties || []), req.params.id);
     res.json({ success: true, message: 'Jadwal piket berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui jadwal piket: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui jadwal piket');
   }
 });
 
@@ -2574,7 +3138,7 @@ app.get('/api/walikelas/seating', (req, res) => {
     const seating = db.prepare('SELECT * FROM walikelas_seating ORDER BY desk_number ASC').all();
     res.json(seating);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat denah duduk: ' + err.message });
+    sendError(res, err, 'Gagal memuat denah duduk');
   }
 });
 
@@ -2591,7 +3155,7 @@ const handleSwap = (req, res) => {
 
     res.json({ success: true, message: 'Posisi tempat duduk berhasil ditukar!' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menukar posisi duduk: ' + err.message });
+    sendError(res, err, 'Gagal menukar posisi duduk');
   }
 };
 app.put('/api/walikelas/seating/swap', handleSwap);
@@ -2603,7 +3167,7 @@ app.put('/api/walikelas/seating/:id', (req, res) => {
     db.prepare('UPDATE walikelas_seating SET student_id = ?, student_name = ? WHERE id = ?').run(student_id || null, student_name || null, req.params.id);
     res.json({ success: true, message: 'Tempat duduk berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengubah tempat duduk: ' + err.message });
+    sendError(res, err, 'Gagal mengubah tempat duduk');
   }
 });
 
@@ -2613,7 +3177,7 @@ app.get('/api/walikelas/rules', (req, res) => {
     const rules = db.prepare('SELECT * FROM walikelas_rules ORDER BY id ASC').all();
     res.json(rules);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat tata tertib: ' + err.message });
+    sendError(res, err, 'Gagal memuat tata tertib');
   }
 });
 
@@ -2626,7 +3190,7 @@ app.post('/api/walikelas/rules', (req, res) => {
     `).run(rule_code || 'TT', category, title, description || null, sanction || null, Number(points) || 5);
     res.status(201).json({ success: true, ruleId: result.lastInsertRowid, message: 'Tata tertib berhasil ditambahkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan tata tertib: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan tata tertib');
   }
 });
 
@@ -2635,7 +3199,7 @@ app.delete('/api/walikelas/rules/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_rules WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Tata tertib berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus aturan: ' + err.message });
+    sendError(res, err, 'Gagal menghapus aturan');
   }
 });
 
@@ -2653,7 +3217,7 @@ app.get('/api/walikelas/schedule', (req, res) => {
     const schedule = db.prepare(query).all(...params);
     res.json(schedule);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat jadwal: ' + err.message });
+    sendError(res, err, 'Gagal memuat jadwal');
   }
 });
 
@@ -2666,7 +3230,7 @@ app.post('/api/walikelas/schedule', (req, res) => {
     `).run(day_name, Number(period_num) || 1, time_start, time_end, subject_name, teacher_name, room || 'R-101');
     res.status(201).json({ success: true, scheduleId: result.lastInsertRowid, message: 'Jadwal pelajaran berhasil ditambahkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan jadwal: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan jadwal');
   }
 });
 
@@ -2675,14 +3239,14 @@ app.delete('/api/walikelas/schedule/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_schedule WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Jadwal pelajaran berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus jadwal: ' + err.message });
+    sendError(res, err, 'Gagal menghapus jadwal');
   }
 });
 
 // Presensi Harian Kelas
 app.get('/api/walikelas/attendance', (req, res) => {
   try {
-    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const date = req.query.date || todayStr();
     const records = db.prepare(`
       SELECT s.id as student_id, s.nis, s.name, s.gender,
              COALESCE(a.status, 'Hadir') as status,
@@ -2694,7 +3258,7 @@ app.get('/api/walikelas/attendance', (req, res) => {
     `).all(date);
     res.json({ date, records });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat presensi: ' + err.message });
+    sendError(res, err, 'Gagal memuat presensi');
   }
 });
 
@@ -2717,7 +3281,7 @@ app.post('/api/walikelas/attendance', (req, res) => {
 
     res.json({ success: true, message: `Presensi tanggal ${date} berhasil disimpan!` });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan presensi: ' + err.message });
+    sendError(res, err, 'Gagal menyimpan presensi');
   }
 });
 
@@ -2727,7 +3291,7 @@ app.get('/api/walikelas/journal', (req, res) => {
     const journal = db.prepare('SELECT * FROM walikelas_journal ORDER BY date DESC, id DESC').all();
     res.json(journal);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat jurnal: ' + err.message });
+    sendError(res, err, 'Gagal memuat jurnal');
   }
 });
 
@@ -2738,10 +3302,10 @@ app.post('/api/walikelas/journal', (req, res) => {
       INSERT INTO walikelas_journal (date, period_range, subject_name, teacher_name, topic_material, attendance_summary, incident_notes, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const result = stmt.run(date || new Date().toISOString().split('T')[0], period_range || 'Jam ke 1-2', subject_name, teacher_name, topic_material, attendance_summary || 'Nihil', incident_notes || null, status || 'Terlaksana');
+    const result = stmt.run(date || todayStr(), period_range || 'Jam ke 1-2', subject_name, teacher_name, topic_material, attendance_summary || 'Nihil', incident_notes || null, status || 'Terlaksana');
     res.status(201).json({ success: true, journalId: result.lastInsertRowid, message: 'Jurnal KBM berhasil dicatat' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mencatat jurnal: ' + err.message });
+    sendError(res, err, 'Gagal mencatat jurnal');
   }
 });
 
@@ -2750,7 +3314,7 @@ app.delete('/api/walikelas/journal/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_journal WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Entri jurnal berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus jurnal: ' + err.message });
+    sendError(res, err, 'Gagal menghapus jurnal');
   }
 });
 
@@ -2762,12 +3326,7 @@ app.get('/api/walikelas/grades', (req, res) => {
       SELECT s.id as student_id, s.nis, s.name,
              g.id as grade_id,
              COALESCE(g.subject_name, ?) as subject_name,
-             COALESCE(g.task_1, 80) as task_1,
-             COALESCE(g.task_2, 85) as task_2,
-             COALESCE(g.mid_exam, 82) as mid_exam,
-             COALESCE(g.final_exam, 88) as final_exam,
-             COALESCE(g.final_grade, 84) as final_grade,
-             COALESCE(g.predicate, 'B') as predicate
+             g.task_1, g.task_2, g.mid_exam, g.final_exam, g.final_grade, g.predicate
       FROM walikelas_students s
       LEFT JOIN walikelas_grades g ON s.id = g.student_id AND g.subject_name = ?
       ORDER BY s.name ASC
@@ -2776,17 +3335,19 @@ app.get('/api/walikelas/grades', (req, res) => {
     const grades = db.prepare(query).all(subj, subj);
     res.json({ subject: subj, records: grades });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat nilai: ' + err.message });
+    sendError(res, err, 'Gagal memuat nilai');
   }
 });
 
 app.post('/api/walikelas/grades', (req, res) => {
   try {
-    const { student_id, subject_name, task_1, task_2, mid_exam, final_exam } = req.body;
-    const t1 = Number(task_1) || 0;
-    const t2 = Number(task_2) || 0;
-    const me = Number(mid_exam) || 0;
-    const fe = Number(final_exam) || 0;
+    const student_id = toNumber(req.body?.student_id);
+    const subject_name = cleanText(req.body?.subject_name, 120);
+    const scores = ['task_1', 'task_2', 'mid_exam', 'final_exam'].map((key) => toNumber(req.body?.[key]));
+    if (!student_id || !db.prepare('SELECT id FROM walikelas_students WHERE id = ?').get(student_id)) return res.status(404).json({ success: false, message: 'Siswa tidak ditemukan di rombel ini.' });
+    if (!subject_name) return res.status(400).json({ success: false, message: 'Mata pelajaran wajib diisi.' });
+    if (scores.some((value) => value === null || value < 0 || value > 100)) return res.status(400).json({ success: false, message: 'Semua komponen nilai harus berupa angka 0-100.' });
+    const [t1, t2, me, fe] = scores;
     const final_grade = Math.round((t1 * 0.2) + (t2 * 0.2) + (me * 0.3) + (fe * 0.3));
     let predicate = 'D';
     if (final_grade >= 90) predicate = 'A';
@@ -2808,7 +3369,7 @@ app.post('/api/walikelas/grades', (req, res) => {
     }
     res.json({ success: true, message: 'Nilai siswa berhasil disimpan!' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan nilai: ' + err.message });
+    sendError(res, err, 'Gagal menyimpan nilai');
   }
 });
 
@@ -2818,14 +3379,14 @@ app.get('/api/walikelas/cases', (req, res) => {
     const cases = db.prepare('SELECT * FROM walikelas_cases ORDER BY id DESC').all();
     res.json(cases);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat buku kasus: ' + err.message });
+    sendError(res, err, 'Gagal memuat buku kasus');
   }
 });
 
 app.post('/api/walikelas/cases', (req, res) => {
   try {
     const { student_id, student_name, date, incident_type, description, action_taken, parent_notified, status } = req.body;
-    const now = new Date().toISOString().split('T')[0];
+    const now = todayStr();
     const stmt = db.prepare(`
       INSERT INTO walikelas_cases (student_id, student_name, date, incident_type, description, action_taken, parent_notified, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2833,21 +3394,24 @@ app.post('/api/walikelas/cases', (req, res) => {
     const result = stmt.run(Number(student_id) || 1, student_name, date || now, incident_type, description, action_taken, parent_notified ? 1 : 0, status || 'Dalam Pemantauan', now);
     res.status(201).json({ success: true, caseId: result.lastInsertRowid, message: 'Kasus pembinaan berhasil dicatat' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mencatat kasus: ' + err.message });
+    sendError(res, err, 'Gagal mencatat kasus');
   }
 });
 
 app.put('/api/walikelas/cases/:id', (req, res) => {
   try {
-    const { status, action_taken, parent_notified } = req.body;
+    const existing = db.prepare('SELECT * FROM walikelas_cases WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Catatan kasus tidak ditemukan.' });
+    const { status, action_taken, parent_notified } = req.body || {};
     db.prepare(`
       UPDATE walikelas_cases
       SET status = ?, action_taken = ?, parent_notified = ?
       WHERE id = ?
-    `).run(status, action_taken, parent_notified ? 1 : 0, req.params.id);
-    res.json({ success: true, message: 'Status pembinaan kasus berhasil diperbarui' });
+    `).run(cleanText(status, 60) || existing.status, cleanText(action_taken, 2000) || existing.action_taken, parent_notified === undefined ? existing.parent_notified : (parent_notified ? 1 : 0), existing.id);
+    const updated = db.prepare('SELECT * FROM walikelas_cases WHERE id = ?').get(existing.id);
+    res.json({ success: true, case: updated, message: 'Status pembinaan kasus berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui kasus: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui kasus');
   }
 });
 
@@ -2856,7 +3420,7 @@ app.delete('/api/walikelas/cases/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_cases WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Catatan kasus berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus kasus: ' + err.message });
+    sendError(res, err, 'Gagal menghapus kasus');
   }
 });
 
@@ -2866,7 +3430,7 @@ app.get('/api/walikelas/p5', (req, res) => {
     const p5Records = db.prepare('SELECT * FROM walikelas_p5 ORDER BY id DESC').all();
     res.json(p5Records);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat catatan P5: ' + err.message });
+    sendError(res, err, 'Gagal memuat catatan P5');
   }
 });
 
@@ -2880,7 +3444,7 @@ app.post('/api/walikelas/p5', (req, res) => {
     const result = stmt.run(Number(student_id) || 1, student_name, project_theme, dimension, predicate || 'BSH', description || null);
     res.status(201).json({ success: true, p5Id: result.lastInsertRowid, message: 'Penilaian P5 berhasil disimpan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menyimpan P5: ' + err.message });
+    sendError(res, err, 'Gagal menyimpan P5');
   }
 });
 
@@ -2889,7 +3453,7 @@ app.delete('/api/walikelas/p5/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_p5 WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Penilaian P5 berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus P5: ' + err.message });
+    sendError(res, err, 'Gagal menghapus P5');
   }
 });
 
@@ -2899,7 +3463,7 @@ app.get('/api/walikelas/inventory', (req, res) => {
     const items = db.prepare('SELECT * FROM walikelas_inventory ORDER BY id ASC').all();
     res.json(items);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat inventaris: ' + err.message });
+    sendError(res, err, 'Gagal memuat inventaris');
   }
 });
 
@@ -2914,7 +3478,7 @@ app.post('/api/walikelas/inventory', (req, res) => {
     const result = stmt.run(code, item_name, Number(quantity) || 1, unit || 'Unit', condition || 'Baik', source || 'Sekolah / BOS', notes || null);
     res.status(201).json({ success: true, itemId: result.lastInsertRowid, message: 'Barang inventaris berhasil ditambahkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menambahkan inventaris: ' + err.message });
+    sendError(res, err, 'Gagal menambahkan inventaris');
   }
 });
 
@@ -2928,7 +3492,7 @@ app.put('/api/walikelas/inventory/:id', (req, res) => {
     `).run(item_name, Number(quantity) || 1, unit || 'Unit', condition, notes, req.params.id);
     res.json({ success: true, message: 'Inventaris berhasil diperbarui' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memperbarui inventaris: ' + err.message });
+    sendError(res, err, 'Gagal memperbarui inventaris');
   }
 });
 
@@ -2937,7 +3501,7 @@ app.delete('/api/walikelas/inventory/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_inventory WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Barang inventaris berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus inventaris: ' + err.message });
+    sendError(res, err, 'Gagal menghapus inventaris');
   }
 });
 
@@ -2947,7 +3511,7 @@ app.get('/api/walikelas/documents', (req, res) => {
     const docs = db.prepare('SELECT * FROM walikelas_documents ORDER BY id DESC').all();
     res.json(docs);
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal memuat dokumen: ' + err.message });
+    sendError(res, err, 'Gagal memuat dokumen');
   }
 });
 
@@ -2958,10 +3522,10 @@ app.post('/api/walikelas/documents', (req, res) => {
       INSERT INTO walikelas_documents (doc_title, category, doc_date, file_url, notes)
       VALUES (?, ?, ?, ?, ?)
     `);
-    const result = stmt.run(doc_title, category || 'Administrasi', doc_date || new Date().toISOString().split('T')[0], file_url || '#', notes || null);
+    const result = stmt.run(doc_title, category || 'Administrasi', doc_date || todayStr(), file_url || '#', notes || null);
     res.status(201).json({ success: true, docId: result.lastInsertRowid, message: 'Dokumen berhasil diarsipkan' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal mengarsipkan dokumen: ' + err.message });
+    sendError(res, err, 'Gagal mengarsipkan dokumen');
   }
 });
 
@@ -2970,8 +3534,48 @@ app.delete('/api/walikelas/documents/:id', (req, res) => {
     db.prepare('DELETE FROM walikelas_documents WHERE id = ?').run(req.params.id);
     res.json({ success: true, message: 'Dokumen berhasil dihapus' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Gagal menghapus dokumen: ' + err.message });
+    sendError(res, err, 'Gagal menghapus dokumen');
   }
+});
+
+// ==========================================
+// PORTAL ORANG TUA (ringkasan anak berdasarkan akun wali)
+// ==========================================
+app.get('/api/ortu/dashboard', (req, res) => {
+  const profile = getSessionProfile(req.auth);
+  let student = profile?.student || null;
+  // Staf berwenang boleh meninjau ringkasan siswa tertentu melalui ?student_id=.
+  if (!student && isStaffRole(req.auth.role) && toNumber(req.query.student_id)) student = getLinkedStudent(toNumber(req.query.student_id));
+  if (!student) return res.status(404).json({ success: false, message: 'Akun ini belum terhubung dengan data siswa. Hubungi tata usaha sekolah.' });
+
+  const today = todayStr();
+  const attendanceToday = withLateFlag(db.prepare("SELECT * FROM attendance WHERE user_type = 'siswa' AND person_id = ? AND date = ? ORDER BY time ASC").all(student.id, today));
+  const recentAttendance = withLateFlag(db.prepare("SELECT * FROM attendance WHERE user_type = 'siswa' AND person_id = ? ORDER BY date DESC, time DESC LIMIT 30").all(student.id));
+  const violations = db.prepare('SELECT id, violation_name, category, points, incident_date, action_taken, status FROM violations WHERE student_id = ? ORDER BY incident_date DESC, id DESC LIMIT 20').all(student.id);
+  const totalPoints = db.prepare('SELECT COALESCE(SUM(points), 0) AS total FROM violations WHERE student_id = ?').get(student.id).total;
+  const sppBills = db.prepare('SELECT * FROM spp_bills WHERE student_id = ? ORDER BY id ASC').all(student.id);
+  const otherBills = db.prepare('SELECT * FROM other_bills WHERE student_id = ?').all(student.id);
+  const grades = db.prepare('SELECT subject_name, semester, academic_year, final_grade, predicate, teacher_notes FROM grades WHERE student_id = ? ORDER BY academic_year DESC, semester DESC, id DESC LIMIT 40').all(student.id);
+  const permissions = db.prepare('SELECT * FROM student_permissions WHERE student_id = ? ORDER BY permission_date DESC, id DESC LIMIT 10').all(student.id);
+  const uksVisits = db.prepare('SELECT id, visit_date, visit_time, complaint, action_taken, disposition FROM uks_visits WHERE student_id = ? ORDER BY visit_date DESC, id DESC LIMIT 10').all(student.id);
+  const homeroomName = student.class_id ? db.prepare('SELECT homeroom_teacher_name FROM classes WHERE id = ?').get(student.class_id)?.homeroom_teacher_name : null;
+  const homeroomTeacher = homeroomName
+    ? (db.prepare('SELECT name, phone, email FROM teachers WHERE lower(trim(name)) = lower(trim(?))').get(homeroomName) || { name: homeroomName, phone: null, email: null })
+    : null;
+  writeAuditLog({ actor: req.auth, action: 'view_sensitive_data', resource: 'ortu_dashboard', req, metadata: { studentId: student.id } });
+
+  res.json({
+    success: true,
+    student,
+    homeroom_teacher: homeroomTeacher,
+    parent: profile ? { name: profile.name, phone: profile.phone || student.parent_phone || null } : null,
+    attendance: { today: attendanceToday, recent: recentAttendance, late_cutoff: LATE_CUTOFF },
+    violations: { records: violations, totalPoints },
+    spp: { sppBills, otherBills, unpaid: sppBills.filter((bill) => bill.status !== 'lunas').length },
+    grades,
+    permissions,
+    uks_visits: uksVisits,
+  });
 });
 
 // ==========================================
@@ -2993,34 +3597,36 @@ app.get('/api/system/audit-log', (req, res) => {
 // ==========================================
 // PRODUCTION FRONTEND STATIC SERVE
 // ==========================================
+// Endpoint /api yang tidak terdaftar selalu dijawab JSON 404 (bukan HTML),
+// baik saat pengembangan (Vite proxy) maupun produksi.
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ success: false, message: `API endpoint ${req.method} ${req.originalUrl} tidak ditemukan` });
+});
+
 const distDir = path.resolve(__dirname, '../dist');
 if (fs.existsSync(distDir)) {
-  app.use(express.static(distDir));
+  app.use(express.static(distDir, { index: false, maxAge: '1h' }));
 
   // Cegah pengembalian index.html untuk aset /assets/* yang tidak ditemukan agar browser tidak crash MIME type
   app.get('/assets/*', (req, res) => {
     res.status(404).type('text/plain').send('Asset not found');
   });
 
-  // Health check endpoint for frontend connection status
-  app.get('/api/health', (req, res) => {
-    res.json({ success: true, status: 'ok', serverTime: new Date().toISOString() });
-  });
-
-  // Cegah pengembalian index.html untuk endpoint /api/* yang tidak terdaftar
-  app.all('/api/*', (req, res) => {
-    res.status(404).json({ success: false, message: `API endpoint ${req.method} ${req.originalUrl} tidak ditemukan` });
-  });
-
   app.get('*', (req, res) => {
     res.sendFile(path.join(distDir, 'index.html'));
+  });
+} else {
+  app.get('/', (req, res) => {
+    res.type('text/plain').send('Server API Sekolah Super App aktif. Jalankan `npm run build` agar antarmuka disajikan dari folder dist, atau gunakan `npm run dev:client` saat pengembangan.');
   });
 }
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ success: false, message: 'Internal Server Error', error: err.message });
+  if (res.headersSent) return next(err);
+  if (err?.type === 'entity.parse.failed') return res.status(400).json({ success: false, message: 'Format data permintaan tidak valid (JSON rusak).' });
+  if (err?.type === 'entity.too.large') return res.status(413).json({ success: false, message: 'Ukuran data yang dikirim terlalu besar (maksimal 25 MB).' });
+  return sendError(res, err, 'Terjadi kesalahan pada server');
 });
 
 app.listen(PORT, '0.0.0.0', () => {

@@ -1,20 +1,25 @@
 {
   "name": "sekolah-super-app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
+  "description": "Sistem informasi sekolah terpadu SMAN 1 Harapan Bangsa: portal publik, PPDB, akademik, presensi, CBT, e-rapor, wali kelas, keuangan, kantin & dompet digital, e-pemilos.",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "dev:server": "node --experimental-sqlite server/index.js",
     "dev:client": "vite",
     "build": "vite build",
+    "preview": "vite preview",
     "start": "node --experimental-sqlite server/index.js",
-    "seed": "node --experimental-sqlite server/seed.js"
+    "seed": "node --experimental-sqlite server/seed.js",
+    "check": "node --check server/index.js && node --check server/db.js && node --check server/seed.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "lucide-react": "^1.16.0",
-    "multer": "^1.4.5-lts.1",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

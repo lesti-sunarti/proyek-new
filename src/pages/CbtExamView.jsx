@@ -16,11 +16,28 @@ import {
   Plus,
   Send,
   HelpCircle,
-  XCircle
+  XCircle,
+  Trash2
 } from 'lucide-react';
 
+const OPTION_KEYS = ['A', 'B', 'C', 'D', 'E'];
+const DEFAULT_QUESTION_POINTS = 10;
+let questionUidCounter = 0;
+const createEmptyQuestion = () => ({
+  uid: `q-${Date.now()}-${questionUidCounter++}`,
+  question_text: '',
+  question_type: 'pg',
+  option_a: '',
+  option_b: '',
+  option_c: '',
+  option_d: '',
+  option_e: '',
+  correct_option: 'A',
+  points: DEFAULT_QUESTION_POINTS
+});
+
 export default function CbtExamView() {
-  const { currentUser, currentRole, isStaff, showToast } = useAuth();
+  const { currentUser, isStaff, showToast } = useAuth();
   const [exams, setExams] = useState([]);
   const [activeExam, setActiveExam] = useState(null);
   const [inExamRoom, setInExamRoom] = useState(false);
@@ -34,6 +51,8 @@ export default function CbtExamView() {
   const [examFinished, setExamFinished] = useState(false);
   const [finishResult, setFinishResult] = useState(null);
   const [examResultsList, setExamResultsList] = useState([]);
+  const [monitorExamId, setMonitorExamId] = useState(null);
+  const [isSubmittingExam, setIsSubmittingExam] = useState(false);
   const [activeTab, setActiveTab] = useState('list'); // 'list', 'create', 'monitor'
 
   // Form Buat Ujian Baru
@@ -42,12 +61,54 @@ export default function CbtExamView() {
   const [newClass, setNewClass] = useState('X MIPA 1');
   const [newDuration, setNewDuration] = useState(45);
   const [newMaxViolations, setNewMaxViolations] = useState(3);
+  const [newPassingScore, setNewPassingScore] = useState(75);
+  const [newQuestions, setNewQuestions] = useState(() => [createEmptyQuestion()]);
+  const [isCreatingExam, setIsCreatingExam] = useState(false);
 
   const examContainerRef = useRef(null);
   const lastViolationTimeRef = useRef(0);
   const examFinishedRef = useRef(false);
   const inExamRoomRef = useRef(false);
   const violationWarningActiveRef = useRef(false);
+  // Ref agar handler event/timer selalu membaca data terbaru (bukan closure usang)
+  const answersRef = useRef({});
+  const activeExamRef = useRef(null);
+  const submittingRef = useRef(false);
+  const dialogOpenRef = useRef(false);
+
+  useEffect(() => {
+    answersRef.current = answers;
+  }, [answers]);
+
+  useEffect(() => {
+    activeExamRef.current = activeExam;
+  }, [activeExam]);
+
+  // Pastikan fullscreen dilepas & deteksi dimatikan saat komponen dilepas (unmount)
+  useEffect(() => {
+    return () => {
+      inExamRoomRef.current = false;
+      examFinishedRef.current = true;
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    };
+  }, []);
+
+  // ID peserta harus berupa angka: siswa memakai related_student_id, akun lain memakai id akun
+  const getStudentId = () => {
+    const raw = currentUser?.related_student_id ?? currentUser?.id ?? 1;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  };
+  const getStudentName = () => currentUser?.name || 'Peserta Ujian';
+
+  // Dialog konfirmasi bawaan browser memicu event blur; tandai agar tidak dihitung pelanggaran
+  const confirmDialog = (message) => {
+    dialogOpenRef.current = true;
+    lastViolationTimeRef.current = Date.now();
+    const ok = window.confirm(message);
+    window.setTimeout(() => { dialogOpenRef.current = false; }, 800);
+    return ok;
+  };
 
   useEffect(() => {
     inExamRoomRef.current = inExamRoom;
@@ -62,11 +123,16 @@ export default function CbtExamView() {
   }, [violationWarning]);
 
   // Fetch available exams
-  const fetchExams = () => {
-    fetch('/api/cbt/exams')
-      .then(res => res.json())
-      .then(data => setExams(data))
-      .catch(() => {});
+  const fetchExams = async () => {
+    try {
+      const res = await fetch('/api/cbt/exams');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memuat daftar ujian');
+      setExams(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setExams([]);
+      showToast(err.message || 'Gagal memuat daftar ujian', 'error');
+    }
   };
 
   useEffect(() => {
@@ -74,39 +140,59 @@ export default function CbtExamView() {
   }, []);
 
   // Fetch results for monitoring (for teachers/admins)
-  const fetchResults = (examId) => {
-    fetch(`/api/cbt/exams/${examId}/results`)
-      .then(res => res.json())
-      .then(data => setExamResultsList(data))
-      .catch(() => {});
+  const fetchResults = async (examId) => {
+    if (!examId) return;
+    setMonitorExamId(examId);
+    try {
+      const res = await fetch(`/api/cbt/exams/${examId}/results`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memuat hasil ujian');
+      setExamResultsList(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setExamResultsList([]);
+      showToast(err.message || 'Gagal memuat hasil ujian', 'error');
+    }
   };
 
   // Mulai Ujian & Load Pertanyaan
-  const startExam = (exam) => {
-    fetch(`/api/cbt/exams/${exam.id}`)
-      .then(res => res.json())
-      .then(fullExam => {
-        setActiveExam(fullExam);
-        setMaxViolations(fullExam.max_violations || 3);
-        setTimeLeft(fullExam.duration_minutes * 60);
-        setAnswers({});
-        setDoubtStatus({});
-        setViolationsCount(0);
-        setViolationWarning(null);
-        setExamFinished(false);
-        setFinishResult(null);
-        setCurrentQuestionIndex(0);
-        
-        examFinishedRef.current = false;
-        inExamRoomRef.current = true;
-        setInExamRoom(true);
+  const startExam = async (exam) => {
+    try {
+      const res = await fetch(`/api/cbt/exams/${exam.id}`);
+      const fullExam = await res.json().catch(() => ({}));
+      if (!res.ok || fullExam.success === false) throw new Error(fullExam.message || 'Gagal memuat soal ujian');
 
-        // Minta Fullscreen
-        enterFullscreen();
-      })
-      .catch(() => {
-        showToast('Gagal memuat soal ujian', 'error');
-      });
+      const questions = Array.isArray(fullExam.questions) ? fullExam.questions : [];
+      if (questions.length === 0) {
+        return showToast('Paket ujian ini belum memiliki soal. Hubungi guru pengampu.', 'error');
+      }
+      const durationMinutes = Number(fullExam.duration_minutes) > 0 ? Number(fullExam.duration_minutes) : 45;
+      const examData = { ...fullExam, questions };
+
+      // Reset ref lebih dulu agar listener/timer membaca kondisi ujian yang baru
+      activeExamRef.current = examData;
+      answersRef.current = {};
+      submittingRef.current = false;
+      examFinishedRef.current = false;
+      inExamRoomRef.current = true;
+      lastViolationTimeRef.current = Date.now(); // toleransi awal saat masuk fullscreen
+
+      setActiveExam(examData);
+      setMaxViolations(Number(fullExam.max_violations) || 3);
+      setTimeLeft(durationMinutes * 60);
+      setAnswers({});
+      setDoubtStatus({});
+      setViolationsCount(0);
+      setViolationWarning(null);
+      setExamFinished(false);
+      setFinishResult(null);
+      setCurrentQuestionIndex(0);
+      setInExamRoom(true);
+
+      // Minta Fullscreen
+      enterFullscreen();
+    } catch (err) {
+      showToast(err.message || 'Gagal memuat soal ujian', 'error');
+    }
   };
 
   const enterFullscreen = () => {
@@ -121,8 +207,10 @@ export default function CbtExamView() {
   // Record Violation Handler (Debounced & Safe)
   const recordViolation = (violationType) => {
     const now = Date.now();
-    if (!inExamRoomRef.current || examFinishedRef.current) return;
-    
+    const exam = activeExamRef.current;
+    if (!exam || !inExamRoomRef.current || examFinishedRef.current || submittingRef.current) return;
+    // Abaikan blur/focus yang dipicu dialog konfirmasi internal (bukan kecurangan)
+    if (dialogOpenRef.current) return;
     // Cegah double triggers beruntun (misal Esc memicu fullscreenchange sekaligus blur dalam 1500ms)
     if (now - lastViolationTimeRef.current < 1500) return;
     // Cegah trigger blur jika dialog peringatan sedang aktif
@@ -130,36 +218,39 @@ export default function CbtExamView() {
 
     lastViolationTimeRef.current = now;
 
-    const studentId = currentUser.studentId || 1;
-    const studentName = currentUser.name;
-
-    fetch(`/api/cbt/exams/${activeExam.id}/violation`, {
+    fetch(`/api/cbt/exams/${exam.id}/violation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        student_id: studentId,
-        student_name: studentName,
+        student_id: getStudentId(),
+        student_name: getStudentName(),
         violation_type: violationType,
         timestamp: new Date().toISOString()
       })
     })
-      .then(res => res.json())
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal mencatat pelanggaran');
+        return data;
+      })
       .then(data => {
-        const newCount = data.violations_count;
+        const newCount = Number(data.violations_count) || 0;
+        const maxAllowed = Number(data.max_violations) || 3;
         setViolationsCount(newCount);
+        setMaxViolations(maxAllowed);
 
         if (data.is_locked) {
-          // AUTO SUBMIT ON CHEATING
+          // AUTO SUBMIT ON CHEATING (jawaban terakhir dibaca dari ref, bukan closure usang)
           setViolationWarning({
-            title: 'UJIAN DIHENTIKAN OTOMATIS! (DISMISSED)',
-            message: 'Anda terdeteksi melakukan pelanggaran berulang melebihi batas maksimal. Sistem Anti-Nyontek otomatis mensubmit lembar ujian Anda.',
+            title: 'UJIAN DIHENTIKAN OTOMATIS!',
+            message: data.message || 'Anda terdeteksi melakukan pelanggaran berulang melebihi batas maksimal. Sistem Anti-Nyontek otomatis mensubmit lembar ujian Anda.',
             critical: true
           });
           submitExam(true);
         } else {
           setViolationWarning({
-            title: `PERINGATAN ANTI-NYONTEK (${newCount}/${data.max_violations})`,
-            message: `Aksi terlarang terdeteksi: [${violationType}]. Jangan membuka tab lain, meminimalkan browser, atau keluar dari layar penuh. Sisa toleransi: ${data.max_violations - newCount}x!`,
+            title: `PERINGATAN ANTI-NYONTEK (${newCount}/${maxAllowed})`,
+            message: `Aksi terlarang terdeteksi: [${violationType}]. Jangan membuka tab lain, meminimalkan browser, atau keluar dari layar penuh. Sisa toleransi: ${Math.max(maxAllowed - newCount, 0)}x!`,
             critical: false
           });
         }
@@ -238,25 +329,26 @@ export default function CbtExamView() {
       window.removeEventListener('contextmenu', handleContextMenu);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [inExamRoom, examFinished, activeExam]);
+  }, [inExamRoom, examFinished]);
 
-  // Timer Countdown
+  // Timer Countdown (satu interval selama di ruang ujian; tanpa efek samping di dalam updater state)
   useEffect(() => {
-    if (!inExamRoom || examFinished || timeLeft <= 0) return;
+    if (!inExamRoom || examFinished) return undefined;
 
     const timer = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          submitExam(false);
-          return 0;
-        }
-        return prev - 1;
-      });
+      setTimeLeft(prev => (prev > 0 ? prev - 1 : 0));
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [inExamRoom, examFinished, timeLeft]);
+  }, [inExamRoom, examFinished]);
+
+  // Waktu habis -> kirim otomatis satu kali (dijaga submittingRef agar tidak ganda)
+  useEffect(() => {
+    if (inExamRoom && !examFinished && timeLeft <= 0 && activeExamRef.current) {
+      showToast('Waktu ujian habis. Jawaban Anda dikirim otomatis.', 'info');
+      submitExam(false);
+    }
+  }, [timeLeft, inExamRoom, examFinished]);
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);
@@ -264,45 +356,150 @@ export default function CbtExamView() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // Submit Ujian (Aman tanpa trigger violation)
-  const submitExam = (isForceSubmitted = false) => {
-    if (!activeExam) return;
+  // Submit Ujian (Aman tanpa trigger violation, tidak bisa terkirim dua kali)
+  const submitExam = async (isForceSubmitted = false) => {
+    const exam = activeExamRef.current;
+    if (!exam || submittingRef.current || examFinishedRef.current) return;
 
+    submittingRef.current = true;
     examFinishedRef.current = true;
     inExamRoomRef.current = false;
+    setIsSubmittingExam(true);
 
-    const studentId = currentUser.studentId || 1;
-    const studentName = currentUser.name;
-
-    fetch(`/api/cbt/exams/${activeExam.id}/submit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        student_id: studentId,
-        student_name: studentName,
-        answers,
-        force_submitted: isForceSubmitted
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        setExamFinished(true);
-        setFinishResult(data);
-        if (document.fullscreenElement) {
-          document.exitFullscreen().catch(() => {});
-        }
-      })
-      .catch(() => {
-        showToast('Koneksi submit ujian gagal', 'error');
+    try {
+      const res = await fetch(`/api/cbt/exams/${exam.id}/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          student_id: getStudentId(),
+          student_name: getStudentName(),
+          answers: answersRef.current,
+          force_submitted: Boolean(isForceSubmitted)
+        })
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal mengirim jawaban ujian');
+
+      setFinishResult(data);
+      setExamFinished(true);
+      setViolationWarning(null); // tutup modal peringatan agar layar hasil (skor) terlihat
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+    } catch (err) {
+      // Gagal terkirim: kembalikan status agar peserta bisa mengirim ulang
+      submittingRef.current = false;
+      examFinishedRef.current = false;
+      inExamRoomRef.current = true;
+      showToast(`Koneksi submit ujian gagal: ${err.message}. Silakan coba kirim ulang.`, 'error');
+    } finally {
+      setIsSubmittingExam(false);
+    }
   };
 
   const exitExamRoom = () => {
+    inExamRoomRef.current = false;
+    examFinishedRef.current = true;
+    submittingRef.current = false;
+    activeExamRef.current = null;
     setInExamRoom(false);
     setActiveExam(null);
     setExamFinished(false);
     setFinishResult(null);
+    setViolationWarning(null);
+    setViolationsCount(0);
+    setTimeLeft(2700);
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
     fetchExams();
+  };
+
+  // ============================================================
+  // FORM BUAT PAKET UJIAN (GURU / ADMIN)
+  // ============================================================
+  const updateNewQuestion = (index, patch) => {
+    setNewQuestions(prev => prev.map((q, i) => (i === index ? { ...q, ...patch } : q)));
+  };
+  const addNewQuestion = () => setNewQuestions(prev => [...prev, createEmptyQuestion()]);
+  const removeNewQuestion = (index) => {
+    setNewQuestions(prev => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
+  };
+  const totalNewPoints = newQuestions.reduce((sum, q) => sum + (Number(q.points) || 0), 0);
+  const resetCreateForm = () => {
+    setNewTitle('');
+    setNewSubject('Informatika & Coding');
+    setNewClass('X MIPA 1');
+    setNewDuration(45);
+    setNewMaxViolations(3);
+    setNewPassingScore(75);
+    setNewQuestions([createEmptyQuestion()]);
+  };
+
+  const handleCreateExam = async () => {
+    const title = newTitle.trim();
+    if (!title) return showToast('Judul ujian tidak boleh kosong', 'error');
+    if (!newSubject.trim() || !newClass.trim()) return showToast('Mata pelajaran dan target kelas wajib diisi', 'error');
+    const duration = Number(newDuration);
+    if (!Number.isInteger(duration) || duration < 1) return showToast('Durasi ujian harus bilangan bulat minimal 1 menit', 'error');
+    const maxViolationsValue = Number(newMaxViolations);
+    if (!Number.isInteger(maxViolationsValue) || maxViolationsValue < 1) return showToast('Batas toleransi pelanggaran minimal 1', 'error');
+    const passingScore = Number(newPassingScore);
+    if (!Number.isFinite(passingScore) || passingScore < 0 || passingScore > 100) return showToast('Passing score (KKM) harus 0 - 100', 'error');
+    if (newQuestions.length === 0) return showToast('Tambahkan minimal satu soal', 'error');
+
+    const preparedQuestions = [];
+    for (let i = 0; i < newQuestions.length; i += 1) {
+      const q = newQuestions[i];
+      const nomor = i + 1;
+      const questionText = String(q.question_text || '').trim();
+      if (!questionText) return showToast(`Teks soal nomor ${nomor} tidak boleh kosong`, 'error');
+      const points = Number(q.points);
+      if (!Number.isFinite(points) || points <= 0) return showToast(`Poin soal nomor ${nomor} harus lebih dari 0`, 'error');
+
+      if (q.question_type === 'pg') {
+        const options = {};
+        OPTION_KEYS.forEach((key) => {
+          const field = `option_${key.toLowerCase()}`;
+          options[field] = String(q[field] || '').trim();
+        });
+        const filledCount = Object.values(options).filter(Boolean).length;
+        if (filledCount < 2) return showToast(`Soal nomor ${nomor}: isi minimal dua teks pilihan jawaban`, 'error');
+        const correctKey = String(q.correct_option || '').toUpperCase();
+        if (!OPTION_KEYS.includes(correctKey)) return showToast(`Soal nomor ${nomor}: pilih kunci jawaban (A-E)`, 'error');
+        if (!options[`option_${correctKey.toLowerCase()}`]) return showToast(`Soal nomor ${nomor}: kunci jawaban ${correctKey} belum memiliki teks pilihan`, 'error');
+        preparedQuestions.push({ question_text: questionText, question_type: 'pg', ...options, correct_option: correctKey, points });
+      } else {
+        preparedQuestions.push({ question_text: questionText, question_type: 'essay', points });
+      }
+    }
+
+    setIsCreatingExam(true);
+    try {
+      const res = await fetch('/api/cbt/exams', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          subject_name: newSubject.trim(),
+          class_name: newClass.trim(),
+          duration_minutes: duration,
+          passing_score: passingScore,
+          max_violations: maxViolationsValue,
+          questions: preparedQuestions
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal membuat paket ujian');
+      showToast(data.message || 'Paket ujian CBT berhasil dibuat!', 'success');
+      resetCreateForm();
+      setActiveTab('list');
+      fetchExams();
+    } catch (err) {
+      showToast(err.message || 'Gagal membuat paket ujian', 'error');
+    } finally {
+      setIsCreatingExam(false);
+    }
   };
 
   // ============================================================
@@ -340,12 +537,24 @@ export default function CbtExamView() {
                   Saya Mengerti & Kembali ke Layar Penuh
                 </button>
               ) : (
-                <button
-                  onClick={exitExamRoom}
-                  className="px-6 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs"
-                >
-                  Keluar dari Ruang Ujian
-                </button>
+                <div className="flex flex-col gap-2">
+                  {isSubmittingExam ? (
+                    <div className="text-xs font-semibold text-slate-700">Mengirim jawaban Anda ke server...</div>
+                  ) : (
+                    <button
+                      onClick={() => submitExam(true)}
+                      className="px-6 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs"
+                    >
+                      Coba Kirim Ulang Jawaban
+                    </button>
+                  )}
+                  <button
+                    onClick={exitExamRoom}
+                    className="px-6 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs"
+                  >
+                    Keluar dari Ruang Ujian
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -374,10 +583,16 @@ export default function CbtExamView() {
 
               <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200">
                 <div className="text-xs text-slate-500">Skor Otomatis (Pilihan Ganda & Essay)</div>
-                <div className="text-4xl font-black text-emerald-400 mt-1">{finishResult?.score || 0} / 100</div>
+                <div className="text-4xl font-black text-emerald-400 mt-1">{finishResult?.score ?? 0} / 100</div>
                 <div className="text-[11px] text-slate-500 mt-1">
-                  Status: {finishResult?.status === 'force_submitted' ? 'Dibatalkan / Terkunci' : 'Lulus / Terekam'}
+                  Status: {finishResult?.status === 'force_submitted' ? 'Dibatalkan / Terkunci' : 'Terekam'}
+                  {activeExam?.passing_score != null && (
+                    <> | KKM {activeExam.passing_score}: {Number(finishResult?.score ?? 0) >= Number(activeExam.passing_score) ? 'Tuntas' : 'Belum Tuntas'}</>
+                  )}
                 </div>
+                {finishResult?.message && (
+                  <div className="text-[11px] text-slate-400 mt-1">{finishResult.message}</div>
+                )}
               </div>
 
               <div className="p-3 rounded-xl bg-slate-50 text-xs text-slate-600 flex justify-between">
@@ -540,14 +755,15 @@ export default function CbtExamView() {
                     </button>
                   ) : (
                     <button
+                      disabled={isSubmittingExam}
                       onClick={() => {
-                        if (confirm('Apakah Anda yakin ingin menyelesaikan dan mengirim ujian ini?')) {
+                        if (confirmDialog('Apakah Anda yakin ingin menyelesaikan dan mengirim ujian ini?')) {
                           submitExam(false);
                         }
                       }}
-                      className="px-6 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold shadow-lg shadow-rose-600/30"
+                      className="px-6 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-white text-xs font-extrabold shadow-lg shadow-rose-600/30"
                     >
-                      Kirim & Selesaikan Ujian
+                      {isSubmittingExam ? 'Mengirim...' : 'Kirim & Selesaikan Ujian'}
                     </button>
                   )}
                 </div>
@@ -607,14 +823,15 @@ export default function CbtExamView() {
 
                 {/* Tombol Selesai Cepat */}
                 <button
+                  disabled={isSubmittingExam}
                   onClick={() => {
-                    if (confirm('Konfirmasi: Kirim semua jawaban ujian sekarang?')) {
+                    if (confirmDialog('Konfirmasi: Kirim semua jawaban ujian sekarang?')) {
                       submitExam(false);
                     }
                   }}
-                  className="w-full py-3 rounded-xl bg-slate-100 hover:bg-rose-600 text-slate-600 hover:text-white text-xs font-bold transition-all border border-slate-200"
+                  className="w-full py-3 rounded-xl bg-slate-100 hover:bg-rose-600 disabled:opacity-60 text-slate-600 hover:text-white text-xs font-bold transition-all border border-slate-200"
                 >
-                  Selesaikan Ujian Sekarang
+                  {isSubmittingExam ? 'Mengirim Jawaban...' : 'Selesaikan Ujian Sekarang'}
                 </button>
               </div>
 
@@ -666,7 +883,8 @@ export default function CbtExamView() {
               <button
                 onClick={() => {
                   setActiveTab('monitor');
-                  if (exams.length > 0) fetchResults(exams[0].id);
+                  const targetId = monitorExamId || exams[0]?.id;
+                  if (targetId) fetchResults(targetId);
                 }}
                 className={`px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
                   activeTab === 'monitor' ? 'bg-rose-600 text-white shadow-lg shadow-rose-600/20' : 'bg-slate-100 text-slate-600 hover:bg-slate-100'
@@ -682,6 +900,11 @@ export default function CbtExamView() {
       {/* TAB 1: LIST UJIAN AKTIF */}
       {activeTab === 'list' && (
         <div className="space-y-4">
+          {exams.length === 0 && (
+            <div className="bg-white border border-dashed border-slate-300 rounded-3xl p-10 text-center text-xs text-slate-500">
+              Belum ada paket ujian yang tersedia saat ini.
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {exams.map((exam) => (
               <div 
@@ -792,8 +1015,9 @@ export default function CbtExamView() {
                 <label className="block text-xs font-semibold text-slate-600 mb-1">Durasi (Menit):</label>
                 <input
                   type="number"
+                  min="1"
                   value={newDuration}
-                  onChange={(e) => setNewDuration(Number(e.target.value))}
+                  onChange={(e) => setNewDuration(e.target.value)}
                   className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
                 />
               </div>
@@ -801,8 +1025,9 @@ export default function CbtExamView() {
                 <label className="block text-xs font-semibold text-slate-600 mb-1">Maksimal Pelanggaran (Toleransi):</label>
                 <input
                   type="number"
+                  min="1"
                   value={newMaxViolations}
-                  onChange={(e) => setNewMaxViolations(Number(e.target.value))}
+                  onChange={(e) => setNewMaxViolations(e.target.value)}
                   className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
                 />
               </div>
@@ -816,48 +1041,118 @@ export default function CbtExamView() {
               <div>✓ Auto-Submit Paksa jika Pelanggaran mencapai batas</div>
             </div>
 
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Passing Score / KKM (0-100):</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                value={newPassingScore}
+                onChange={(e) => setNewPassingScore(e.target.value)}
+                className="w-full bg-white border border-slate-300 rounded-xl px-4 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all"
+              />
+            </div>
+
+            {/* Editor Soal */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="block text-xs font-semibold text-slate-600">
+                  Daftar Soal ({newQuestions.length}) | Total {totalNewPoints} poin
+                </label>
+                <button
+                  type="button"
+                  onClick={addNewQuestion}
+                  className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Tambah Soal
+                </button>
+              </div>
+
+              {newQuestions.map((q, idx) => (
+                <div key={q.uid} className="p-4 rounded-2xl border border-slate-200 bg-slate-50 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-slate-700">Soal {idx + 1}</span>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={q.question_type}
+                        onChange={(e) => updateNewQuestion(idx, { question_type: e.target.value })}
+                        className="bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-[#002147]"
+                      >
+                        <option value="pg">Pilihan Ganda</option>
+                        <option value="essay">Essay</option>
+                      </select>
+                      <input
+                        type="number"
+                        min="1"
+                        value={q.points}
+                        onChange={(e) => updateNewQuestion(idx, { points: e.target.value })}
+                        title="Poin soal"
+                        className="w-20 bg-white border border-slate-300 rounded-lg px-2 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-[#002147]"
+                      />
+                      <span className="text-[10px] text-slate-500">poin</span>
+                      <button
+                        type="button"
+                        onClick={() => removeNewQuestion(idx)}
+                        disabled={newQuestions.length === 1}
+                        title="Hapus soal"
+                        className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-50 disabled:opacity-30"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <textarea
+                    rows={2}
+                    value={q.question_text}
+                    onChange={(e) => updateNewQuestion(idx, { question_text: e.target.value })}
+                    placeholder="Tuliskan teks soal di sini..."
+                    className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147]"
+                  />
+
+                  {q.question_type === 'pg' && (
+                    <div className="space-y-2">
+                      {OPTION_KEYS.map((optKey) => {
+                        const field = `option_${optKey.toLowerCase()}`;
+                        const isKey = q.correct_option === optKey;
+                        return (
+                          <div key={optKey} className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => updateNewQuestion(idx, { correct_option: optKey })}
+                              title="Jadikan kunci jawaban"
+                              className={`w-8 h-8 rounded-lg text-xs font-bold shrink-0 ${
+                                isKey ? 'bg-emerald-600 text-white' : 'bg-white border border-slate-300 text-slate-600 hover:border-emerald-400'
+                              }`}
+                            >
+                              {optKey}
+                            </button>
+                            <input
+                              type="text"
+                              value={q[field]}
+                              onChange={(e) => updateNewQuestion(idx, { [field]: e.target.value })}
+                              placeholder={`Teks pilihan ${optKey}${optKey === 'E' ? ' (opsional)' : ''}`}
+                              className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147]"
+                            />
+                          </div>
+                        );
+                      })}
+                      <p className="text-[11px] text-slate-500">
+                        Klik huruf untuk menandai kunci jawaban. Kunci saat ini: <strong className="text-emerald-700">{q.correct_option}</strong>
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
             <button
-              onClick={() => {
-                if (!newTitle) return showToast('Judul ujian tidak boleh kosong', 'error');
-                fetch('/api/cbt/exams', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    title: newTitle,
-                    subject_name: newSubject,
-                    class_name: newClass,
-                    duration_minutes: newDuration,
-                    max_violations: newMaxViolations,
-                    questions: [
-                      {
-                        question_text: 'Jelaskan konsep dasar algoritma enkripsi data dan keamanannya!',
-                        question_type: 'essay',
-                        points: 50
-                      },
-                      {
-                        question_text: 'Komponen hardware yang berfungsi mempertahankan daya sementara saat listrik padam adalah...',
-                        question_type: 'pg',
-                        option_a: 'UPS (Uninterruptible Power Supply)',
-                        option_b: 'Motherboard',
-                        option_c: 'RAM',
-                        option_d: 'VGA',
-                        option_e: 'Heatsink',
-                        correct_option: 'A',
-                        points: 50
-                      }
-                    ]
-                  })
-                })
-                  .then(res => res.json())
-                  .then(data => {
-                    showToast('Paket ujian CBT berhasil dibuat!', 'success');
-                    setActiveTab('list');
-                    fetchExams();
-                  });
-              }}
-              className="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-lg shadow-rose-600/30"
+              type="button"
+              onClick={handleCreateExam}
+              disabled={isCreatingExam}
+              className="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-white text-xs font-bold shadow-lg shadow-rose-600/30"
             >
-              Simpan & Terbitkan Ujian CBT
+              {isCreatingExam ? 'Menyimpan Paket Ujian...' : 'Simpan & Terbitkan Ujian CBT'}
             </button>
           </div>
         </div>
@@ -870,12 +1165,25 @@ export default function CbtExamView() {
             <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
               <ShieldAlert className="w-4 h-4 text-rose-400" /> Hasil Ujian & Catatan Pelanggaran Siswa
             </h3>
-            <button
-              onClick={() => exams.length > 0 && fetchResults(exams[0].id)}
-              className="p-2 rounded-xl bg-slate-100 hover:bg-slate-100 text-slate-600 text-xs flex items-center gap-1"
-            >
-              <RefreshCw className="w-3.5 h-3.5" /> Refresh
-            </button>
+            <div className="flex items-center gap-2">
+              <select
+                value={monitorExamId ?? ''}
+                onChange={(e) => fetchResults(Number(e.target.value))}
+                className="bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-[#002147] max-w-[260px]"
+                title="Pilih paket ujian yang dimonitor"
+              >
+                {exams.length === 0 && <option value="">Belum ada paket ujian</option>}
+                {exams.map((exam) => (
+                  <option key={exam.id} value={exam.id}>{exam.title} ({exam.class_name})</option>
+                ))}
+              </select>
+              <button
+                onClick={() => fetchResults(monitorExamId || exams[0]?.id)}
+                className="p-2 rounded-xl bg-slate-100 hover:bg-slate-100 text-slate-600 text-xs flex items-center gap-1"
+              >
+                <RefreshCw className="w-3.5 h-3.5" /> Refresh
+              </button>
+            </div>
           </div>
 
           <div className="overflow-x-auto">
@@ -894,14 +1202,14 @@ export default function CbtExamView() {
                 {examResultsList.map((res) => (
                   <tr key={res.id} className="hover:bg-slate-50">
                     <td className="py-3 px-4 font-semibold text-slate-900">{res.student_name}</td>
-                    <td className="py-3 px-4 font-mono text-slate-500">{res.start_time?.substring(11, 19)}</td>
-                    <td className="py-3 px-4 font-mono text-slate-500">{res.submit_time ? res.submit_time.substring(11, 19) : '-'}</td>
-                    <td className="py-3 px-4 font-extrabold text-emerald-400 text-sm">{res.score} / 100</td>
+                    <td className="py-3 px-4 font-mono text-slate-500">{res.start_time ? String(res.start_time).substring(11, 19) : '-'}</td>
+                    <td className="py-3 px-4 font-mono text-slate-500">{res.submit_time ? String(res.submit_time).substring(11, 19) : '-'}</td>
+                    <td className="py-3 px-4 font-extrabold text-emerald-400 text-sm">{res.score ?? '-'} / 100</td>
                     <td className="py-3 px-4">
                       <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                         res.violations_count > 0 ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-100 text-slate-500'
                       }`}>
-                        {res.violations_count}x Tercatat
+                        {res.violations_count ?? 0}x Tercatat
                       </span>
                     </td>
                     <td className="py-3 px-4">
@@ -910,7 +1218,7 @@ export default function CbtExamView() {
                           ? 'bg-rose-600 text-white' 
                           : 'bg-emerald-500/20 text-emerald-400'
                       }`}>
-                        {res.status === 'force_submitted' ? 'FORCE SUBMIT (CURANG)' : 'SELESAI NORMAL'}
+                        {res.status === 'force_submitted' ? 'FORCE SUBMIT (CURANG)' : res.status === 'ongoing' ? 'SEDANG MENGERJAKAN' : 'SELESAI NORMAL'}
                       </span>
                     </td>
                   </tr>

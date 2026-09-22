@@ -14,9 +14,24 @@ import {
   CheckCircle2 
 } from 'lucide-react';
 
+// Batasan yang sama dengan server (/api/upload): JPG/PNG/WEBP, maksimal 5 MB.
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
+
 export default function GalleryView() {
-  const { isStaff, showToast } = useAuth();
+  const { canAccess, showToast } = useAuth();
+  // Unggah foto memerlukan modul 'broadcast' (bukan sekadar akun staf); halaman ini publik untuk tamu.
+  const canManageGallery = canAccess('broadcast');
   const [gallery, setGallery] = useState([]);
+  const [loadError, setLoadError] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [selectedPhoto, setSelectedPhoto] = useState(null);
   const [showUploadModal, setShowUploadModal] = useState(false);
@@ -33,7 +48,9 @@ export default function GalleryView() {
   const [dragActive, setDragActive] = useState(false);
 
   const loadGallery = () => {
-    fetch('/api/gallery').then(r => r.json()).then(setGallery).catch(() => {});
+    fetchJson('/api/gallery')
+      .then(data => { setGallery(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setGallery([]); setLoadError(err.message || 'Galeri belum dapat dimuat.'); });
   };
 
   useEffect(() => {
@@ -46,15 +63,16 @@ export default function GalleryView() {
 
   const handleFileChange = (e) => {
     const file = e.target.files?.[0];
+    e.target.value = ''; // izinkan memilih file yang sama lagi setelah "Ganti Foto"
     if (file) processFile(file);
   };
 
   const processFile = (file) => {
-    if (!file.type.startsWith('image/')) {
-      return showToast('Harap pilih file gambar (JPG, PNG, WEBP, GIF)', 'error');
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      return showToast('Format tidak didukung. Gunakan JPG, PNG, atau WEBP.', 'error');
     }
-    if (file.size > 25 * 1024 * 1024) {
-      return showToast('Ukuran gambar maksimal 25 MB', 'error');
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return showToast('Ukuran gambar maksimal 5 MB.', 'error');
     }
     setSelectedFile(file);
     const reader = new FileReader();
@@ -65,6 +83,7 @@ export default function GalleryView() {
         setTitle(baseName.charAt(0).toUpperCase() + baseName.slice(1));
       }
     };
+    reader.onerror = () => showToast('File gambar tidak dapat dibaca.', 'error');
     reader.readAsDataURL(file);
   };
 
@@ -92,19 +111,31 @@ export default function GalleryView() {
     setPreviewImage('');
   };
 
+  const resetForm = () => {
+    setTitle('');
+    setImageUrl('');
+    setDescription('');
+    setSelectedFile(null);
+    setPreviewImage('');
+  };
+
   const handleUpload = async (e) => {
     e.preventDefault();
-    if (!title) return showToast('Judul / Caption foto wajib diisi', 'error');
+    if (isUploading) return;
+    if (!canManageGallery) return showToast('Akun Anda tidak memiliki hak untuk mengunggah foto galeri.', 'error');
+    const cleanTitle = title.trim();
+    if (!cleanTitle) return showToast('Judul / Caption foto wajib diisi', 'error');
 
-    let finalImageUrl = imageUrl;
+    let finalImageUrl = imageUrl.trim();
+    if (uploadMode === 'file' && !previewImage) {
+      return showToast('Silakan pilih foto dari perangkat Anda terlebih dahulu', 'error');
+    }
+    if (uploadMode === 'url' && !finalImageUrl) return showToast('URL gambar harus diisi', 'error');
 
-    if (uploadMode === 'file') {
-      if (!previewImage) {
-        return showToast('Silakan pilih foto dari perangkat Anda terlebih dahulu', 'error');
-      }
-      setIsUploading(true);
-      try {
-        const upRes = await fetch('/api/upload', {
+    setIsUploading(true);
+    try {
+      if (uploadMode === 'file') {
+        const upData = await fetchJson('/api/upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -112,42 +143,26 @@ export default function GalleryView() {
             filename: selectedFile?.name || 'dokumentasi.jpg'
           })
         });
-        const upData = await upRes.json();
-        if (!upData.success) {
-          setIsUploading(false);
-          return showToast(upData.message || 'Gagal mengunggah gambar', 'error');
-        }
+        if (!upData.url) throw new Error('Server tidak mengembalikan alamat file.');
         finalImageUrl = upData.url;
-      } catch (err) {
-        setIsUploading(false);
-        return showToast('Gagal mengunggah gambar: ' + err.message, 'error');
       }
-    } else {
-      if (!finalImageUrl) return showToast('URL gambar harus diisi', 'error');
-    }
 
-    try {
-      const res = await fetch('/api/gallery', {
+      const data = await fetchJson('/api/gallery', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title,
+          title: cleanTitle,
           category,
           image_url: finalImageUrl,
-          description
+          description: description.trim()
         })
       });
-      const data = await res.json();
       showToast(data.message || 'Foto galeri berhasil disimpan!', 'success');
       setShowUploadModal(false);
-      setTitle('');
-      setImageUrl('');
-      setDescription('');
-      setSelectedFile(null);
-      setPreviewImage('');
+      resetForm();
       loadGallery();
     } catch (err) {
-      showToast('Gagal menyimpan foto galeri: ' + err.message, 'error');
+      showToast(err.message || 'Gagal menyimpan foto galeri', 'error');
     } finally {
       setIsUploading(false);
     }
@@ -168,7 +183,7 @@ export default function GalleryView() {
           </p>
         </div>
 
-        {isStaff && (
+        {canManageGallery && (
           <button
             onClick={() => setShowUploadModal(true)}
             className="px-4 py-2.5 rounded-xl bg-[#002147] hover:bg-[#002e62] text-white text-xs font-bold shadow-md shadow-[#002147]/20 flex items-center gap-2 transition-all cursor-pointer"
@@ -239,8 +254,12 @@ export default function GalleryView() {
       {filteredGallery.length === 0 && (
         <div className="bg-white border border-slate-200 rounded-3xl p-12 text-center space-y-3">
           <ImageIcon className="w-12 h-12 mx-auto text-slate-300" />
-          <p className="text-sm font-bold text-slate-700">Belum ada foto dalam kategori ini</p>
-          <p className="text-xs text-slate-500">Klik tombol "Unggah Foto Dokumentasi" di atas untuk menambahkan foto pertama.</p>
+          <p className="text-sm font-bold text-slate-700">{loadError ? 'Galeri belum dapat dimuat' : 'Belum ada foto dalam kategori ini'}</p>
+          <p className="text-xs text-slate-500">
+            {loadError || (canManageGallery
+              ? 'Klik tombol "Unggah Foto Dokumentasi" di atas untuk menambahkan foto pertama.'
+              : 'Dokumentasi akan tampil di sini setelah diunggah oleh pengelola sekolah.')}
+          </p>
         </div>
       )}
 
@@ -355,7 +374,7 @@ export default function GalleryView() {
                         atau seret & jatuhkan file gambar ke kotak ini
                       </p>
                       <span className="mt-2 text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                        PNG, JPG, JPEG, WEBP (Maks. 25 MB)
+                        PNG, JPG, JPEG, WEBP (Maks. 5 MB)
                       </span>
                     </label>
                   ) : (

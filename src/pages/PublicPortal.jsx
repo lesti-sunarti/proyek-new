@@ -31,21 +31,55 @@ export default function PublicPortal() {
   const [agendas, setAgendas] = useState([]);
 
   useEffect(() => {
+    let isMounted = true;
+    // Semua sumber data publik bersifat opsional: bila gagal/kosong, halaman tetap tampil dengan fallback
+    const safeJson = async (res) => {
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data === null || data?.success === false) throw new Error(data?.message || `HTTP ${res.status}`);
+      return data;
+    };
+
     fetch('/api/public/stats')
-      .then(res => res.json())
-      .then(data => setStats(data))
+      .then(safeJson)
+      .then((data) => {
+        if (!isMounted || !data || typeof data !== 'object' || Array.isArray(data)) return;
+        // Gabungkan dengan nilai default agar field yang hilang tetap punya fallback
+        setStats((prev) => ({ ...prev, ...data }));
+      })
       .catch(() => {});
 
     fetch('/api/blogs')
-      .then(res => res.json())
-      .then(data => setNews(data.slice(0, 3)))
+      .then(safeJson)
+      .then((data) => {
+        if (!isMounted || !Array.isArray(data)) return;
+        setNews(data.filter((item) => item && (!item.status || item.status === 'published')).slice(0, 3));
+      })
       .catch(() => {});
 
     fetch('/api/agenda')
-      .then(res => res.json())
-      .then(data => setAgendas(data.slice(0, 3)))
+      .then(safeJson)
+      .then((data) => {
+        if (!isMounted || !Array.isArray(data)) return;
+        // Tampilkan agenda yang akan datang (terdekat dulu); jika tidak ada, tampilkan agenda terakhir
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const valid = data.filter((ag) => ag && ag.event_date);
+        const upcoming = valid.filter((ag) => {
+          const d = new Date(ag.event_date);
+          return !Number.isNaN(d.getTime()) && d >= today;
+        });
+        setAgendas((upcoming.length > 0 ? upcoming : valid.slice(-3)).slice(0, 3));
+      })
       .catch(() => {});
+
+    return () => { isMounted = false; };
   }, []);
+
+  const formatAgendaDate = (value) => {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return { month: '-', day: '-' };
+    return { month: d.toLocaleString('id-ID', { month: 'short' }), day: d.getDate() };
+  };
 
   return (
     <div className="space-y-10 pb-16">
@@ -224,15 +258,22 @@ export default function PublicPortal() {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {news.length === 0 && (
+              <div className="sm:col-span-2 bg-white border border-dashed border-slate-300 rounded-2xl p-8 text-center text-xs text-slate-500">
+                Belum ada berita yang dapat ditampilkan saat ini.
+              </div>
+            )}
             {news.map((item) => (
               <div 
                 key={item.id}
                 onClick={() => setActiveModule('blog')}
                 className="bg-white border border-slate-200 rounded-2xl overflow-hidden cursor-pointer hover:border-slate-300 hover:shadow-md transition-all group flex flex-col justify-between shadow-xs"
               >
-                <img 
-                  src={item.cover_image} 
-                  alt={item.title} 
+                <img
+                  src={item.cover_image || 'https://images.unsplash.com/photo-1497633762265-9d179a990aa6?w=800'}
+                  alt={item.title || 'Berita sekolah'}
+                  loading="lazy"
+                  onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = 'https://images.unsplash.com/photo-1497633762265-9d179a990aa6?w=800'; }}
                   className="w-full h-36 object-cover group-hover:scale-105 transition-transform duration-300"
                 />
                 <div className="p-4 flex-1 flex flex-col justify-between">
@@ -272,22 +313,30 @@ export default function PublicPortal() {
           </div>
 
           <div className="space-y-3">
-            {agendas.map((ag) => (
+            {agendas.length === 0 && (
+              <div className="bg-white border border-dashed border-slate-300 rounded-2xl p-6 text-center text-xs text-slate-500">
+                Belum ada agenda kegiatan yang terjadwal.
+              </div>
+            )}
+            {agendas.map((ag) => {
+              const tanggal = formatAgendaDate(ag.event_date);
+              return (
               <div key={ag.id} className="bg-white border border-slate-200 rounded-2xl p-4 flex gap-4 items-center hover:border-slate-300 transition-colors shadow-xs">
                 <div className="w-14 h-14 rounded-2xl bg-[#002147] text-[#f4a024] flex flex-col items-center justify-center shrink-0">
-                  <span className="text-[10px] uppercase font-bold text-slate-200">{new Date(ag.event_date).toLocaleString('id-ID', { month: 'short' })}</span>
-                  <span className="text-lg font-black">{new Date(ag.event_date).getDate()}</span>
+                  <span className="text-[10px] uppercase font-bold text-slate-200">{tanggal.month}</span>
+                  <span className="text-lg font-black">{tanggal.day}</span>
                 </div>
                 <div className="min-w-0 flex-1">
                   <h4 className="text-xs font-bold text-[#002147] truncate">{ag.title}</h4>
                   <p className="text-[11px] text-slate-500 mt-0.5 line-clamp-1">{ag.description}</p>
                   <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-slate-400">
-                    <span className="inline-flex items-center gap-1"><MapPin className="h-3 w-3" /> {ag.location}</span>
-                    <span className="inline-flex items-center gap-1"><Clock3 className="h-3 w-3" /> {ag.start_time}</span>
+                    <span className="inline-flex items-center gap-1"><MapPin className="h-3 w-3" /> {ag.location || '-'}</span>
+                    <span className="inline-flex items-center gap-1"><Clock3 className="h-3 w-3" /> {ag.start_time || '-'}</span>
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 

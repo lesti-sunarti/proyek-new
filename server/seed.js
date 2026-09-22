@@ -1,9 +1,16 @@
+import { pathToFileURL } from 'url';
 import { db, hashPassword, initDatabase } from './db.js';
 
-initDatabase();
+function localDateString(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
 
-export function seedDatabase() {
-  console.log('🌱 Seeding database with realistic school data...');
+// Seeder bersifat idempoten: setiap blok hanya mengisi tabel yang masih kosong,
+// sehingga aman dipanggil pada setiap start server maupun lewat `npm run seed`.
+export function seedDatabase({ verbose = true } = {}) {
+  const log = verbose ? console.log : () => {};
+  log('🌱 Seeding database with realistic school data...');
 
   // 1. Classes
   const classCheck = db.prepare('SELECT COUNT(*) as count FROM classes').get();
@@ -93,7 +100,7 @@ export function seedDatabase() {
       INSERT INTO attendance (user_type, person_id, person_name, person_identifier, date, time, type, subject_name, status, method, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const today = new Date().toISOString().split('T')[0];
+    const today = localDateString();
     insertAtt.run('siswa', 1, 'Aditya Pratama Putra', '0061234561', today, '06:48:15', 'masuk', null, 'hadir', 'self_scan', 'Tepat waktu via Scanner HP');
     insertAtt.run('siswa', 2, 'Anisa Maharani', '0061234562', today, '06:55:00', 'masuk', null, 'hadir', 'kiosk_card', 'Tap kartu pos gerbang');
     insertAtt.run('siswa', 3, 'Dimas Satria Wicaksana', '0061234563', today, '07:10:20', 'masuk', null, 'hadir', 'self_scan', 'Toleransi keterlambatan 10 menit');
@@ -517,7 +524,13 @@ export function seedDatabase() {
     insertOrder.run('KNT-2025-0012', 'Aditya Pratama Putra', 'siswa', '0061234561', 20000, 'wallet', 'paid', 'selesai', 'Istirahat 1 (09.30)', 'Tidak pakai cabai rawit', null, null, sampleItems, '2025-02-12 12:15:00');
   }
 
-  console.log('✅ Database seeded successfully with 100% complete mock data (including Kantin & Dompet Digital)!');
+  log('✅ Database seeded successfully with 100% complete mock data (including Kantin & Dompet Digital)!');
 }
 
-seedDatabase();
+// Jalankan langsung hanya bila file ini dieksekusi sebagai skrip (`npm run seed`),
+// bukan saat diimpor oleh server.
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  initDatabase();
+  seedDatabase();
+}

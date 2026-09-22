@@ -82,13 +82,16 @@ const PRESET_PHOTOS = [
   { label: 'Poster Alternatif 6', url: '/pemilos/692e8aea2ceef.png' },
 ];
 
+const ALLOWED_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // batas /api/upload di server
+
 export default function PemilosView() {
-  const { currentUser, currentRole, showToast } = useAuth();
+  const { currentUser, showToast, isAuthenticated, openLogin } = useAuth();
 
   // Active sub-tab
   const [activeTab, setActiveTab] = useState('bilik'); // 'bilik', 'hasil', 'pengawas', 'manajemen'
 
-  // Load initial candidates from localStorage or default
+  // Cache lokal hanya sebagai tampilan awal sebelum data server tiba (server = sumber kebenaran)
   const getInitialCandidates = () => {
     try {
       const saved = localStorage.getItem('pemilos_candidates');
@@ -102,15 +105,20 @@ export default function PemilosView() {
 
   const [candidates, setCandidates] = useState(getInitialCandidates);
   const [stats, setStats] = useState({
-    totalCandidates: candidates.length || 4,
-    totalVoters: 41,
-    presentVoters: 1,
+    totalCandidates: 0,
+    totalVoters: 0,
+    presentVoters: 0,
     totalVoted: 0,
     totalVoteSum: 0,
     turnoutPct: 0
   });
-  const [voters, setVoters] = useState([]);
+  const [voters, setVoters] = useState([]);        // DPT sesuai filter (tabel Meja Pengawas)
+  const [allVoters, setAllVoters] = useState([]);  // seluruh DPT tanpa filter (identitas bilik & daftar kelas)
   const [loading, setLoading] = useState(false);
+  const [votersLoading, setVotersLoading] = useState(false);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [accessError, setAccessError] = useState('');
+  const [isSavingCand, setIsSavingCand] = useState(false);
 
   // Filter & Search
   const [searchDpt, setSearchDpt] = useState('');
@@ -166,130 +174,178 @@ export default function PemilosView() {
   // Guide modal
   const [showGuideModal, setShowGuideModal] = useState(false);
 
-  // Load stats & candidates
-  const loadStatsAndCandidates = () => {
+  // Terjemahkan respons non-OK menjadi pesan error; 401 = sesi habis (tampilkan ajakan login)
+  const handleApiFailure = (res, data, fallbackMsg) => {
+    if (res.status === 401) {
+      setNeedsLogin(true);
+      return 'Sesi Anda telah berakhir. Silakan masuk kembali untuk menggunakan E-Pemilos.';
+    }
+    if (res.status === 403) {
+      const msg = data?.message || 'Akun Anda tidak memiliki hak akses modul E-Pemilos.';
+      setAccessError(msg);
+      return msg;
+    }
+    return data?.message || fallbackMsg;
+  };
+
+  // Load stats & candidates (respons stats = objek, kandidat = array)
+  const loadStatsAndCandidates = async () => {
+    if (!isAuthenticated) return;
     setLoading(true);
-    fetch('/api/pemilos/stats')
-      .then(r => r.json())
-      .then(d => {
-        if (d.success) {
-          setStats(prev => ({
-            ...prev,
-            ...d,
-            totalCandidates: d.totalCandidates || candidates.length || 4,
-            totalVoters: d.totalVoters || prev.totalVoters || 41
-          }));
-        }
-      })
-      .catch(() => {});
+    try {
+      const [statsRes, candRes] = await Promise.all([
+        fetch('/api/pemilos/stats'),
+        fetch('/api/pemilos/candidates')
+      ]);
 
-    fetch('/api/pemilos/candidates')
-      .then(r => r.json())
-      .then(d => {
-        if (Array.isArray(d) && d.length > 0) {
-          setCandidates(d);
-          try {
-            localStorage.setItem('pemilos_candidates', JSON.stringify(d));
-          } catch {}
-        }
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+      const statsData = await statsRes.json().catch(() => ({}));
+      if (statsRes.ok && statsData.success) {
+        setStats({
+          totalCandidates: Number(statsData.totalCandidates) || 0,
+          totalVoters: Number(statsData.totalVoters) || 0,
+          presentVoters: Number(statsData.presentVoters) || 0,
+          totalVoted: Number(statsData.totalVoted) || 0,
+          totalVoteSum: Number(statsData.totalVoteSum) || 0,
+          turnoutPct: Number(statsData.turnoutPct) || 0
+        });
+      } else {
+        handleApiFailure(statsRes, statsData, '');
+      }
+
+      const candData = await candRes.json().catch(() => null);
+      if (candRes.ok && Array.isArray(candData)) {
+        // Data server adalah sumber kebenaran, termasuk saat daftar kosong
+        setCandidates(candData);
+        try {
+          localStorage.setItem('pemilos_candidates', JSON.stringify(candData));
+        } catch {}
+      }
+    } catch {
+      // Server tidak terjangkau: tetap tampilkan cache lokal / data bawaan (hanya tampilan)
+    } finally {
+      setLoading(false);
+    }
   };
 
-  // Load voters
-  const loadVoters = () => {
+  const buildVotersUrl = (withFilters) => {
     const params = new URLSearchParams();
-    if (filterClass !== 'all') params.append('class_name', filterClass);
-    if (filterStatus !== 'all') params.append('status', filterStatus);
-    if (searchDpt.trim()) params.append('q', searchDpt.trim());
-
-    fetch(`/api/pemilos/voters?${params.toString()}`)
-      .then(r => r.json())
-      .then(d => { if (Array.isArray(d) && d.length > 0) setVoters(d); })
-      .catch(() => {});
+    if (withFilters) {
+      if (filterClass !== 'all') params.append('class_name', filterClass);
+      if (filterStatus !== 'all') params.append('status', filterStatus);
+      if (searchDpt.trim()) params.append('q', searchDpt.trim());
+    }
+    const qs = params.toString();
+    return `/api/pemilos/voters${qs ? `?${qs}` : ''}`;
   };
 
-  useEffect(() => {
+  const fetchVoterList = async (url) => {
+    const res = await fetch(url);
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !Array.isArray(data)) {
+      handleApiFailure(res, data, '');
+      return null;
+    }
+    return data;
+  };
+
+  const hasVoterFilter = filterClass !== 'all' || filterStatus !== 'all' || searchDpt.trim() !== '';
+
+  // DPT sesuai filter/pencarian (hasil kosong tetap ditampilkan sebagai kosong)
+  const loadVoters = async () => {
+    if (!isAuthenticated) return;
+    setVotersLoading(true);
+    try {
+      const data = await fetchVoterList(buildVotersUrl(true));
+      if (data) {
+        setVoters(data);
+        // Tanpa filter, hasilnya = seluruh DPT; hindari request ganda yang identik
+        if (!hasVoterFilter) setAllVoters(data);
+      }
+    } catch {
+      // biarkan data lama tampil bila server tidak terjangkau
+    } finally {
+      setVotersLoading(false);
+    }
+  };
+
+  // Seluruh DPT tanpa filter, dipakai untuk identitas pemilih aktif & daftar kelas
+  const loadAllVoters = async () => {
+    if (!isAuthenticated) return;
+    try {
+      const data = await fetchVoterList(buildVotersUrl(false));
+      if (data) setAllVoters(data);
+    } catch {}
+  };
+
+  const refreshAll = () => {
     loadStatsAndCandidates();
     loadVoters();
-  }, []);
+    if (hasVoterFilter) loadAllVoters();
+  };
 
   useEffect(() => {
-    loadVoters();
-  }, [filterClass, filterStatus, searchDpt]);
+    if (!isAuthenticated) {
+      setNeedsLogin(true);
+      return;
+    }
+    setNeedsLogin(false);
+    setAccessError('');
+    loadStatsAndCandidates();
+    // DPT (filter & seluruh) dimuat oleh efek filter di bawah
+  }, [isAuthenticated]);
 
-  // Current active voter record
-  const currentVoter = voters.find(v => v.voter_id === activeVoterId || v.voter_name?.toLowerCase() === currentUser?.name?.toLowerCase());
+  // Muat ulang tabel DPT saat filter berubah (debounce agar tidak memanggil API tiap ketikan)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const timer = setTimeout(loadVoters, 300);
+    return () => clearTimeout(timer);
+  }, [isAuthenticated, filterClass, filterStatus, searchDpt]);
 
-  // Handle Vote Action
+  // Pemilih aktif di bilik: dicari di seluruh DPT (bukan hasil filter).
+  // Prioritas: NIS/ID yang diketik; bila kosong, pakai nama akun yang login.
+  const typedVoterId = activeVoterId.trim();
+  const currentVoter = typedVoterId
+    ? (allVoters.find(v => String(v.voter_id).toLowerCase() === typedVoterId.toLowerCase()) || null)
+    : (allVoters.find(v => v.voter_name && currentUser?.name && v.voter_name.toLowerCase() === currentUser.name.toLowerCase()) || null);
+  const effectiveVoterId = currentVoter ? currentVoter.voter_id : typedVoterId;
+  const voterUnknown = !currentVoter && typedVoterId !== '';
+
+  // Handle Vote Action (POST /api/pemilos/vote {voter_id, candidate_id} -> {success, receipt, message})
   const handleExecuteVote = async () => {
-    if (!confirmVoteModal.candidate) return;
+    const candidate = confirmVoteModal.candidate;
+    if (!candidate) return;
+    if (!effectiveVoterId) {
+      return showToast('Masukkan NIS/ID pemilih pada kotak Identitas Pemilih Aktif terlebih dahulu.', 'error');
+    }
     setIsVoting(true);
 
     try {
-      const vId = currentVoter ? currentVoter.voter_id : activeVoterId;
       const res = await fetch('/api/pemilos/vote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          voter_id: vId,
-          candidate_id: confirmVoteModal.candidate.id
+          voter_id: effectiveVoterId,
+          candidate_id: candidate.id
         })
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message, 'success');
-        setConfirmVoteModal({ open: false, candidate: null });
-        setReceiptModal({ open: true, receipt: data.receipt });
-        loadStatsAndCandidates();
-        loadVoters();
-      } else {
-        // Fallback simulation in case of local offline
-        setCandidates(prev => {
-          const updated = prev.map(c => c.id === confirmVoteModal.candidate.id ? { ...c, vote_count: (c.vote_count || 0) + 1 } : c);
-          try { localStorage.setItem('pemilos_candidates', JSON.stringify(updated)); } catch {}
-          return updated;
-        });
-        showToast('Suara berhasil dicatat untuk ' + confirmVoteModal.candidate.pair_names + '!', 'success');
-        setConfirmVoteModal({ open: false, candidate: null });
-        setReceiptModal({
-          open: true,
-          receipt: {
-            tokenReceipt: 'KPOS-' + Math.floor(1000 + Math.random() * 9000),
-            candidateNumber: confirmVoteModal.candidate.candidate_number,
-            candidateName: confirmVoteModal.candidate.pair_names,
-            voterName: currentVoter?.voter_name || 'Dra. Hj. Nurhayati, M.M.',
-            votedAt: new Date().toLocaleTimeString('id-ID')
-          }
-        });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Suara tidak dapat dicatat. Silakan coba lagi.'));
       }
-    } catch {
-      // Local fallback
-      setCandidates(prev => {
-        const updated = prev.map(c => c.id === confirmVoteModal.candidate.id ? { ...c, vote_count: (c.vote_count || 0) + 1 } : c);
-        try { localStorage.setItem('pemilos_candidates', JSON.stringify(updated)); } catch {}
-        return updated;
-      });
-      showToast('Suara Anda berhasil dicatat!', 'success');
+      showToast(data.message || 'Suara berhasil dicatat!', 'success');
       setConfirmVoteModal({ open: false, candidate: null });
-      setReceiptModal({
-        open: true,
-        receipt: {
-          tokenReceipt: 'KPOS-' + Math.floor(1000 + Math.random() * 9000),
-          candidateNumber: confirmVoteModal.candidate.candidate_number,
-          candidateName: confirmVoteModal.candidate.pair_names,
-          voterName: currentVoter?.voter_name || 'Dra. Hj. Nurhayati, M.M.',
-          votedAt: new Date().toLocaleTimeString('id-ID')
-        }
-      });
+      setReceiptModal({ open: true, receipt: data.receipt || null });
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server pemungutan suara', 'error');
     } finally {
       setIsVoting(false);
     }
   };
 
-  // Toggle Presence at Supervisor Desk
+  // Toggle Presence at Supervisor Desk (PUT /voters/:id/presence {is_present})
   const handleTogglePresence = async (voter) => {
+    if (!voter?.id) return;
     try {
       const newPresence = voter.is_present === 1 ? 0 : 1;
       const res = await fetch(`/api/pemilos/voters/${voter.id}/presence`, {
@@ -297,142 +353,136 @@ export default function PemilosView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_present: newPresence })
       });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        loadVoters();
-        loadStatsAndCandidates();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal memperbarui presensi TPS'));
       }
-    } catch {
-      showToast('Presensi TPS berhasil diperbarui!', 'success');
-      setVoters(prev => prev.map(v => v.id === voter.id ? { ...v, is_present: v.is_present === 1 ? 0 : 1 } : v));
+      showToast(data.message || 'Presensi TPS berhasil diperbarui!', 'success');
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
     }
   };
 
-  // Reset Voter Vote
+  // Reset Voter Vote (POST /voters/:id/reset)
   const handleResetVoter = async (voterId, name) => {
     if (!window.confirm(`Reset hak suara pemilih "${name}" agar dapat memilih ulang?`)) return;
     try {
       const res = await fetch(`/api/pemilos/voters/${voterId}/reset`, { method: 'POST' });
-      const data = await res.json();
-      if (data.success) {
-        showToast(data.message, 'success');
-        loadVoters();
-        loadStatsAndCandidates();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal mereset hak suara pemilih'));
       }
-    } catch {
-      showToast('Hak suara berhasil direset', 'success');
+      showToast(data.message || 'Hak suara berhasil direset', 'success');
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
     }
   };
 
-  // Reset Entire Election
+  // Reset Entire Election (POST /reset-all: suara & presensi seluruh DPT ikut direset di server)
   const handleResetAllElection = async () => {
     if (!window.confirm('PERINGATAN: Apakah Anda yakin ingin mereset seluruh hasil suara pemilu untuk simulasi baru?')) return;
     try {
-      await fetch('/api/pemilos/reset-all', { method: 'POST' });
-    } catch {}
-    setCandidates(prev => {
-      const resetList = prev.map(c => ({ ...c, vote_count: 0 }));
-      try { localStorage.setItem('pemilos_candidates', JSON.stringify(resetList)); } catch {}
-      return resetList;
-    });
-    setStats(prev => ({ ...prev, totalVoted: 0, totalVoteSum: 0, turnoutPct: 0 }));
-    showToast('Seluruh suara berhasil direset ke 0', 'success');
+      const res = await fetch('/api/pemilos/reset-all', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal mereset hasil pemilu'));
+      }
+      showToast(data.message || 'Seluruh suara berhasil direset ke 0', 'success');
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
+    }
   };
 
-  // Upload File handler (Base64 + /api/upload)
+  // Upload File handler (Base64 -> POST /api/upload {image, filename} -> {success, url})
   const handleFileUpload = async (file, target = 'add') => {
     if (!file) return;
-    if (!file.type.startsWith('image/')) {
-      showToast('Harap pilih file gambar (JPG, PNG, WEBP)', 'error');
+    if (!ALLOWED_PHOTO_TYPES.includes(file.type)) {
+      showToast('Format foto harus JPG, PNG, atau WEBP', 'error');
+      return;
+    }
+    if (file.size > MAX_PHOTO_BYTES) {
+      showToast('Ukuran foto maksimal 5 MB', 'error');
       return;
     }
 
+    const applyPhoto = (url) => {
+      if (target === 'edit') {
+        setEditCand(prev => ({ ...prev, photo_url: url }));
+      } else {
+        setNewCand(prev => ({ ...prev, photo_url: url }));
+      }
+    };
+
     setIsUploadingPhoto(true);
     try {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const base64Data = reader.result;
-        try {
-          const res = await fetch('/api/upload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: base64Data, filename: file.name })
-          });
-          const data = await res.json();
-          if (res.ok && data.success) {
-            showToast('Foto berhasil diunggah!', 'success');
-            if (target === 'edit') {
-              setEditCand(prev => ({ ...prev, photo_url: data.url }));
-            } else {
-              setNewCand(prev => ({ ...prev, photo_url: data.url }));
-            }
-          } else {
-            // Fallback: gunakan base64 langsung
-            if (target === 'edit') {
-              setEditCand(prev => ({ ...prev, photo_url: base64Data }));
-            } else {
-              setNewCand(prev => ({ ...prev, photo_url: base64Data }));
-            }
-            showToast('Foto siap digunakan (pratinjau lokal)', 'info');
-          }
-        } catch {
-          if (target === 'edit') {
-            setEditCand(prev => ({ ...prev, photo_url: base64Data }));
-          } else {
-            setNewCand(prev => ({ ...prev, photo_url: base64Data }));
-          }
-          showToast('Foto berhasil dimuat ke formulir', 'info');
-        } finally {
-          setIsUploadingPhoto(false);
-        }
-      };
-      reader.readAsDataURL(file);
+      const base64Data = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('Gagal membaca file gambar'));
+        reader.readAsDataURL(file);
+      });
+
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: base64Data, filename: file.name })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.url) {
+        throw new Error(handleApiFailure(res, data, 'Gagal mengunggah foto'));
+      }
+      applyPhoto(data.url);
+      showToast('Foto berhasil diunggah!', 'success');
     } catch (err) {
-      showToast('Gagal membaca file: ' + err.message, 'error');
+      showToast(err.message || 'Gagal mengunggah foto', 'error');
+    } finally {
       setIsUploadingPhoto(false);
     }
   };
 
-  // Add Candidate
+  // Add Candidate (POST /api/pemilos/candidates; nomor urut kosong = otomatis di server)
   const handleAddCandidate = async (e) => {
     e.preventDefault();
-    if (!newCand.pair_names.trim()) return showToast('Nama paslon wajib diisi!', 'error');
-
-    let candNum = Number(newCand.candidate_number);
-    if (!candNum) {
-      candNum = (Math.max(0, ...candidates.map(c => c.candidate_number || 0))) + 1;
+    const pairNames = newCand.pair_names.trim();
+    if (!pairNames) return showToast('Nama paslon wajib diisi!', 'error');
+    if (!newCand.vision.trim() || !newCand.mission.trim()) {
+      return showToast('Visi dan misi paslon wajib diisi!', 'error');
     }
 
-    const newEntry = {
-      id: Date.now(),
-      candidate_number: candNum,
-      pair_names: newCand.pair_names.trim(),
-      vision: newCand.vision || 'Mewujudkan kepengurusan OSIS yang berkarakter dan berprestasi.',
-      mission: newCand.mission || '1. Mengembangkan potensi bakat siswa.\n2. Menampung aspirasi warga sekolah.',
-      photo_url: newCand.photo_url || '/pemilos/default.jpg',
-      vote_count: 0
-    };
+    const candNum = Number(newCand.candidate_number) || null;
+    if (candNum && candidates.some(c => Number(c.candidate_number) === candNum)) {
+      return showToast(`Nomor urut ${candNum} sudah dipakai paslon lain`, 'error');
+    }
 
-    // Update state & localStorage immediately
-    setCandidates(prev => {
-      const updated = [...prev, newEntry];
-      try { localStorage.setItem('pemilos_candidates', JSON.stringify(updated)); } catch {}
-      return updated;
-    });
-
+    setIsSavingCand(true);
     try {
-      await fetch('/api/pemilos/candidates', {
+      const res = await fetch('/api/pemilos/candidates', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newCand)
+        body: JSON.stringify({
+          candidate_number: candNum,
+          pair_names: pairNames,
+          vision: newCand.vision.trim(),
+          mission: newCand.mission.trim(),
+          photo_url: newCand.photo_url.trim() || null
+        })
       });
-    } catch {}
-
-    showToast(`Paslon No. ${candNum} (${newCand.pair_names}) berhasil ditambahkan!`, 'success');
-    setShowAddCandModal(false);
-    setNewCand({ candidate_number: '', pair_names: '', vision: '', mission: '', photo_url: '' });
-    loadStatsAndCandidates();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal menambahkan paslon'));
+      }
+      showToast(data.message || `Paslon ${pairNames} berhasil ditambahkan!`, 'success');
+      setShowAddCandModal(false);
+      setNewCand({ candidate_number: '', pair_names: '', vision: '', mission: '', photo_url: '' });
+      loadStatsAndCandidates();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
+    } finally {
+      setIsSavingCand(false);
+    }
   };
 
   // Open Edit Candidate Modal
@@ -440,97 +490,119 @@ export default function PemilosView() {
     setEditCand({
       id: cand.id,
       candidate_number: cand.candidate_number,
-      pair_names: cand.pair_names,
-      vision: cand.vision,
-      mission: cand.mission,
+      pair_names: cand.pair_names || '',
+      vision: cand.vision || '',
+      mission: cand.mission || '',
       photo_url: cand.photo_url || ''
     });
     setShowEditCandModal(true);
   };
 
-  // Save Edit Candidate (Immediate state + localStorage + API)
+  // Save Edit Candidate (PUT /api/pemilos/candidates/:id)
   const handleSaveEditCandidate = async (e) => {
     e.preventDefault();
-    if (!editCand.pair_names.trim()) return showToast('Nama paslon wajib diisi!', 'error');
+    const pairNames = (editCand.pair_names || '').trim();
+    if (!pairNames) return showToast('Nama paslon wajib diisi!', 'error');
 
-    // 1. Instantly update React state & localStorage
-    setCandidates(prev => {
-      const updated = prev.map(c => (c.id === editCand.id || c.candidate_number === editCand.candidate_number) ? { ...c, ...editCand } : c);
-      try { localStorage.setItem('pemilos_candidates', JSON.stringify(updated)); } catch {}
-      return updated;
-    });
+    const candNum = Number(editCand.candidate_number);
+    if (!candNum || candNum < 1) return showToast('Nomor urut harus berupa angka lebih dari 0', 'error');
+    if (candidates.some(c => c.id !== editCand.id && Number(c.candidate_number) === candNum)) {
+      return showToast(`Nomor urut ${candNum} sudah dipakai paslon lain`, 'error');
+    }
 
-    // 2. Send to backend
+    const payload = {
+      candidate_number: candNum,
+      pair_names: pairNames,
+      vision: (editCand.vision || '').trim(),
+      mission: (editCand.mission || '').trim(),
+      photo_url: (editCand.photo_url || '').trim()
+    };
+
+    setIsSavingCand(true);
     try {
       const res = await fetch(`/api/pemilos/candidates/${editCand.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editCand)
+        body: JSON.stringify(payload)
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message || 'Data paslon berhasil diperbarui!', 'success');
-      } else {
-        showToast('Data paslon berhasil diperbarui di layar!', 'success');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal memperbarui data paslon'));
       }
-    } catch {
-      showToast('Perubahan nama dan foto paslon berhasil disimpan!', 'success');
+      // Perbarui hanya paslon yang diedit (berdasarkan id), dari data server
+      setCandidates(prev => prev.map(c => (c.id === editCand.id ? { ...c, ...(data.candidate || payload) } : c)));
+      showToast(data.message || 'Data paslon berhasil diperbarui!', 'success');
+      setShowEditCandModal(false);
+      loadStatsAndCandidates();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
+    } finally {
+      setIsSavingCand(false);
     }
-
-    setShowEditCandModal(false);
   };
 
-  // Delete Candidate
+  // Delete Candidate (DELETE /api/pemilos/candidates/:id; suara pemilih paslon ini direset di server)
   const handleDeleteCandidate = async (candId, name) => {
     if (!window.confirm(`Hapus pasangan calon "${name}" dari pemilu?`)) return;
 
-    setCandidates(prev => {
-      const updated = prev.filter(c => c.id !== candId);
-      try { localStorage.setItem('pemilos_candidates', JSON.stringify(updated)); } catch {}
-      return updated;
-    });
-
     try {
-      await fetch(`/api/pemilos/candidates/${candId}`, { method: 'DELETE' });
-    } catch {}
-
-    showToast('Paslon berhasil dihapus', 'success');
+      const res = await fetch(`/api/pemilos/candidates/${candId}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal menghapus paslon'));
+      }
+      setCandidates(prev => prev.filter(c => c.id !== candId));
+      showToast(data.message || 'Paslon berhasil dihapus', 'success');
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
+    }
   };
 
-  // Add Voter
+  // Add Voter (POST /api/pemilos/voters {voter_id, voter_name, class_name, voter_role})
   const handleAddVoter = async (e) => {
     e.preventDefault();
-    if (!newVoter.voter_id.trim() || !newVoter.voter_name.trim()) {
-      return showToast('NIS dan Nama pemilih wajib diisi!', 'error');
+    const payload = {
+      voter_id: newVoter.voter_id.trim(),
+      voter_name: newVoter.voter_name.trim(),
+      class_name: newVoter.class_name.trim(),
+      voter_role: newVoter.voter_role || 'siswa'
+    };
+    if (!payload.voter_id || !payload.voter_name || !payload.class_name) {
+      return showToast('NIS, Nama, dan Kelas pemilih wajib diisi!', 'error');
+    }
+    if (allVoters.some(v => String(v.voter_id).toLowerCase() === payload.voter_id.toLowerCase())) {
+      return showToast(`NIS/ID ${payload.voter_id} sudah terdaftar di DPT`, 'error');
     }
 
     try {
       const res = await fetch('/api/pemilos/voters', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newVoter)
+        body: JSON.stringify(payload)
       });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        showToast(data.message, 'success');
-        setShowAddVoterModal(false);
-        setNewVoter({ voter_id: '', voter_name: '', class_name: 'X MIPA 1', voter_role: 'siswa' });
-        loadVoters();
-        loadStatsAndCandidates();
-      } else {
-        showToast(data.message || 'Gagal menambahkan pemilih', 'error');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(handleApiFailure(res, data, 'Gagal menambahkan pemilih'));
       }
-    } catch {
-      showToast('Gagal menghubungi server', 'error');
+      showToast(data.message || 'Pemilih berhasil ditambahkan ke DPT', 'success');
+      setShowAddVoterModal(false);
+      setNewVoter({ voter_id: '', voter_name: '', class_name: 'X MIPA 1', voter_role: 'siswa' });
+      refreshAll();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghubungi server', 'error');
     }
   };
 
-  // Find Winner
-  const highestVote = Math.max(0, ...candidates.map(c => c.vote_count || 0));
-  const leadingCandidate = candidates.find(c => (c.vote_count || 0) === highestVote && highestVote > 0);
+  // Rekapitulasi suara (hindari pembagian nol saat belum ada suara)
+  const totalVoteSum = candidates.reduce((s, c) => s + (Number(c.vote_count) || 0), 0);
+  const highestVote = candidates.reduce((m, c) => Math.max(m, Number(c.vote_count) || 0), 0);
+  const leadingCandidate = highestVote > 0
+    ? candidates.find(c => (Number(c.vote_count) || 0) === highestVote) || null
+    : null;
 
-  // Unique classes for filter
-  const uniqueClasses = Array.from(new Set(voters.map(v => v.class_name).filter(Boolean)));
+  // Daftar kelas untuk filter DPT (dari seluruh DPT, bukan hasil filter)
+  const uniqueClasses = Array.from(new Set(allVoters.map(v => v.class_name).filter(Boolean))).sort();
 
   return (
     <div className="space-y-6 pb-16">
@@ -587,6 +659,28 @@ export default function PemilosView() {
         </div>
       </div>
 
+      {/* PERINGATAN SESI / HAK AKSES */}
+      {(needsLogin || accessError) && (
+        <div className="bg-amber-50 border-2 border-amber-300 rounded-3xl p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3 text-xs font-bold text-amber-950">
+            <AlertTriangle className="w-5 h-5 text-amber-700 shrink-0" />
+            <span>
+              {needsLogin
+                ? 'Anda belum masuk atau sesi telah berakhir. Data di layar hanya tampilan; silakan masuk untuk menggunakan bilik suara, meja pengawas, dan panel KPOS.'
+                : accessError}
+            </span>
+          </div>
+          {needsLogin && (
+            <button
+              onClick={openLogin}
+              className="px-4 py-2.5 rounded-2xl bg-black hover:bg-neutral-800 text-white text-xs font-black shrink-0"
+            >
+              Masuk Sekarang
+            </button>
+          )}
+        </div>
+      )}
+
       {/* METRIC STATS ROW */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         <div className="bg-white p-4 rounded-2xl border-2 border-slate-200 shadow-sm flex items-center gap-3">
@@ -606,7 +700,7 @@ export default function PemilosView() {
           </div>
           <div>
             <div className="text-[10px] text-slate-500 font-black uppercase">DPT Pemilih</div>
-            <div className="text-lg font-black text-black">{voters.length || 41} Siswa/Guru</div>
+            <div className="text-lg font-black text-black">{stats.totalVoters} Siswa/Guru</div>
             <div className="text-[10px] font-bold text-slate-500">Daftar Pemilih Tetap</div>
           </div>
         </div>
@@ -617,7 +711,7 @@ export default function PemilosView() {
           </div>
           <div>
             <div className="text-[10px] text-slate-500 font-black uppercase">Hadir di TPS</div>
-            <div className="text-lg font-black text-black">{stats.presentVoters || 1} Orang</div>
+            <div className="text-lg font-black text-black">{stats.presentVoters} Orang</div>
             <div className="text-[10px] font-bold text-indigo-700">Terverifikasi Pengawas</div>
           </div>
         </div>
@@ -628,8 +722,8 @@ export default function PemilosView() {
           </div>
           <div>
             <div className="text-[10px] text-slate-500 font-black uppercase">Suara Masuk</div>
-            <div className="text-lg font-black text-emerald-700">{candidates.reduce((sum, c) => sum + (c.vote_count || 0), 0)} Suara</div>
-            <div className="text-[10px] font-bold text-emerald-800">Telah Mencoblos</div>
+            <div className="text-lg font-black text-emerald-700">{totalVoteSum} Suara</div>
+            <div className="text-[10px] font-bold text-emerald-800">{stats.totalVoted} Pemilih Telah Mencoblos</div>
           </div>
         </div>
 
@@ -640,7 +734,7 @@ export default function PemilosView() {
           <div>
             <div className="text-[10px] text-slate-500 font-black uppercase">Partisipasi DPT</div>
             <div className="text-lg font-black text-black">
-              {voters.length > 0 ? ((candidates.reduce((sum, c) => sum + (c.vote_count || 0), 0) / voters.length) * 100).toFixed(1) : '0'}%
+              {stats.totalVoters > 0 ? ((stats.totalVoted / stats.totalVoters) * 100).toFixed(1) : '0'}%
             </div>
             <div className="text-[10px] font-bold text-slate-500">Voter Turnout</div>
           </div>
@@ -686,28 +780,59 @@ export default function PemilosView() {
 
           {/* Kotak Identitas Pemilih & Status Bilik */}
           <div className="bg-white border-2 border-slate-200 rounded-3xl p-5 sm:p-6 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-            <div className="space-y-1">
+            <div className="space-y-2">
               <div className="text-xs font-black uppercase text-slate-500 tracking-wider">Identitas Pemilih Aktif</div>
               <div className="flex flex-wrap items-center gap-2">
                 <h3 className="text-base sm:text-lg font-black text-black">
-                  {currentVoter ? currentVoter.voter_name : currentUser?.name || 'Dra. Hj. Nurhayati, M.M.'}
+                  {currentVoter
+                    ? currentVoter.voter_name
+                    : voterUnknown
+                      ? 'Pemilih belum terdaftar di DPT'
+                      : (currentUser?.name || 'Pemilih')}
                 </h3>
                 <span className="px-2.5 py-0.5 rounded-full text-xs font-black uppercase bg-slate-100 text-black border border-slate-300">
-                  {currentVoter ? currentVoter.class_name : 'X MIPA 1'}
+                  {currentVoter ? currentVoter.class_name : voterUnknown ? 'Umum' : '-'}
                 </span>
                 <span className="px-2.5 py-0.5 rounded-full text-xs font-black uppercase bg-amber-100 text-amber-950 border border-amber-300">
-                  ID: {currentVoter ? currentVoter.voter_id : activeVoterId}
+                  ID: {effectiveVoterId || '-'}
                 </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <label htmlFor="pemilos-active-voter" className="text-[11px] font-bold text-slate-600">NIS / ID Pemilih:</label>
+                <input
+                  id="pemilos-active-voter"
+                  type="text"
+                  list="pemilos-dpt-list"
+                  value={activeVoterId}
+                  onChange={(e) => setActiveVoterId(e.target.value)}
+                  placeholder="Ketik NIS/ID dari DPT"
+                  className="w-44 px-3 py-1.5 text-xs font-bold bg-slate-50 border-2 border-slate-300 rounded-xl text-black placeholder:text-slate-400 focus:outline-none focus:border-black"
+                />
+                <datalist id="pemilos-dpt-list">
+                  {allVoters.map(v => (
+                    <option key={v.id} value={v.voter_id}>{v.voter_name} - {v.class_name}</option>
+                  ))}
+                </datalist>
+                {voterUnknown && (
+                  <span className="text-[11px] font-bold text-amber-800">
+                    ID tidak ada di DPT: akan didaftarkan otomatis sebagai "Pemilih Mandiri" saat mencoblos.
+                  </span>
+                )}
               </div>
             </div>
 
             {/* Status Hak Suara */}
             <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
-              {currentVoter?.has_voted ? (
+              {!currentVoter ? (
+                <div className="px-4 py-2.5 rounded-2xl bg-slate-100 border border-slate-300 text-slate-800 text-xs font-black flex items-center gap-2">
+                  <HelpCircle className="w-4 h-4 text-slate-600" />
+                  {effectiveVoterId ? 'Pemilih di Luar DPT (Verifikasi Otomatis)' : 'Masukkan NIS/ID Pemilih untuk Membuka Bilik'}
+                </div>
+              ) : currentVoter.has_voted ? (
                 <div className="px-4 py-2.5 rounded-2xl bg-emerald-100 border border-emerald-300 text-emerald-950 text-xs font-black flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-emerald-700" /> Hak Suara Anda Telah Sah Digunakan
                 </div>
-              ) : currentVoter?.is_present ? (
+              ) : currentVoter.is_present ? (
                 <div className="px-4 py-2.5 rounded-2xl bg-blue-100 border border-blue-300 text-blue-950 text-xs font-black flex items-center gap-2">
                   <Vote className="w-4 h-4 text-blue-700" /> Siap Memilih (Bilik Terbuka)
                 </div>
@@ -717,9 +842,7 @@ export default function PemilosView() {
                     <AlertTriangle className="w-4 h-4 text-amber-700" /> Belum Absen di Meja Pengawas TPS
                   </div>
                   <button
-                    onClick={() => {
-                      if (currentVoter) handleTogglePresence(currentVoter);
-                    }}
+                    onClick={() => handleTogglePresence(currentVoter)}
                     className="px-3.5 py-2.5 rounded-2xl bg-black hover:bg-neutral-800 text-white text-xs font-black transition-colors"
                   >
                     Absen Sekarang
@@ -743,10 +866,15 @@ export default function PemilosView() {
               </p>
             </div>
 
+            {candidates.length === 0 && (
+              <div className="p-10 text-center rounded-3xl border-2 border-dashed border-slate-300 text-slate-500 text-xs font-bold">
+                {loading ? 'Memuat daftar pasangan calon...' : 'Belum ada pasangan calon terdaftar. Tambahkan paslon melalui tab Manajemen KPOS.'}
+              </div>
+            )}
+
             {/* GRID KARTU PASLON */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
               {candidates.map(cand => {
-                const isWinner = leadingCandidate?.id === cand.id;
                 const hasVotedThis = currentVoter?.voted_candidate_id === cand.id;
                 return (
                   <div
@@ -787,6 +915,7 @@ export default function PemilosView() {
                         alt={cand.pair_names}
                         className="max-h-[200px] w-auto object-contain rounded-2xl border border-slate-200 shadow-inner transition-transform group-hover/photo:scale-105"
                         onError={(e) => {
+                          e.target.onerror = null; // cegah loop bila gambar cadangan juga gagal
                           e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=300';
                         }}
                       />
@@ -838,13 +967,13 @@ export default function PemilosView() {
                         {/* Tombol Coblos */}
                         <button
                           onClick={() => setConfirmVoteModal({ open: true, candidate: cand })}
-                          disabled={currentVoter?.has_voted === 1 || currentVoter?.is_present === 0}
+                          disabled={needsLogin || !effectiveVoterId || currentVoter?.has_voted === 1 || currentVoter?.is_present === 0}
                           className={`w-full py-3 rounded-2xl font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-md transition-all ${
                             currentVoter?.has_voted === 1
                               ? hasVotedThis
                                 ? 'bg-emerald-600 text-white cursor-default'
                                 : 'bg-slate-200 text-slate-400 cursor-not-allowed'
-                              : currentVoter?.is_present === 0
+                              : (needsLogin || !effectiveVoterId || currentVoter?.is_present === 0)
                               ? 'bg-amber-100 text-amber-900 border border-amber-300 cursor-not-allowed opacity-80'
                               : 'bg-emerald-700 hover:bg-emerald-800 text-white shadow-emerald-700/25'
                           }`}
@@ -857,6 +986,10 @@ export default function PemilosView() {
                             ) : (
                               'Suara Terkunci'
                             )
+                          ) : needsLogin ? (
+                            'Masuk untuk Memilih'
+                          ) : !effectiveVoterId ? (
+                            'Isi NIS/ID Pemilih'
                           ) : currentVoter?.is_present === 0 ? (
                             'Belum Absen TPS'
                           ) : (
@@ -913,11 +1046,16 @@ export default function PemilosView() {
             </div>
           )}
 
-          {/* GRID TALLY & PROGRESS BARS */}
+          {candidates.length === 0 && (
+            <div className="p-10 text-center rounded-3xl border-2 border-dashed border-slate-300 text-slate-500 text-xs font-bold bg-white">
+              Belum ada pasangan calon terdaftar, rekapitulasi suara belum dapat ditampilkan.
+            </div>
+          )}
+
+          {/* GRID TALLY & PROGRESS BARS (persentase dari total suara masuk; aman saat 0 suara) */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {candidates.map(cand => {
-              const totalSum = candidates.reduce((s, c) => s + (c.vote_count || 0), 0);
-              const votePct = totalSum > 0 ? (((cand.vote_count || 0) / totalSum) * 100).toFixed(1) : 0;
+              const votePct = totalVoteSum > 0 ? Number((((Number(cand.vote_count) || 0) / totalVoteSum) * 100).toFixed(1)) : 0;
               const isLeading = leadingCandidate?.id === cand.id;
 
               return (
@@ -978,8 +1116,10 @@ export default function PemilosView() {
               <div className="font-bold text-black uppercase">BERITA ACARA REKAPITULASI PENGHITUNGAN SUARA</div>
               <div>Tanggal Pelaksanaan: {new Date().toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</div>
               <div>Tempat Pemungutan : TPS 01 - Gedung Utama & E-Voting Server</div>
-              <div>Total DPT Terdaftar: {voters.length || 41} Pemilih</div>
-              <div>Total Suara Sah Masuk: {candidates.reduce((s, c) => s + (c.vote_count || 0), 0)} Suara</div>
+              <div>Total DPT Terdaftar: {stats.totalVoters} Pemilih</div>
+              <div>Pemilih Hadir di TPS: {stats.presentVoters} Orang</div>
+              <div>Pemilih Telah Mencoblos: {stats.totalVoted} Orang ({stats.totalVoters > 0 ? ((stats.totalVoted / stats.totalVoters) * 100).toFixed(1) : '0'}%)</div>
+              <div>Total Suara Sah Masuk: {totalVoteSum} Suara</div>
               <div className="pt-2 font-bold text-black border-t border-slate-300">
                 Pemenang Suara Terbanyak: {leadingCandidate ? `Paslon No. ${leadingCandidate.candidate_number} - ${leadingCandidate.pair_names}` : 'Belum Ada Suara'}
               </div>
@@ -1007,7 +1147,7 @@ export default function PemilosView() {
             </div>
           </div>
 
-          {/* Filter & Search Bar */}
+          {/* Filter & Search Bar (server: ?class_name=&status=voted|unvoted|present|absent&q=) */}
           <div className="flex flex-col sm:flex-row gap-3">
             <div className="relative flex-1">
               <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
@@ -1019,6 +1159,38 @@ export default function PemilosView() {
                 className="w-full pl-9 pr-4 py-2.5 text-xs font-bold bg-slate-50 border-2 border-slate-300 rounded-2xl text-black placeholder:text-slate-500 focus:outline-none focus:border-black"
               />
             </div>
+            <select
+              value={filterClass}
+              onChange={(e) => setFilterClass(e.target.value)}
+              className="px-3 py-2.5 text-xs font-bold bg-slate-50 border-2 border-slate-300 rounded-2xl text-black focus:outline-none focus:border-black"
+              title="Filter kelas / rombel"
+            >
+              <option value="all">Semua Kelas</option>
+              {uniqueClasses.map(cls => (
+                <option key={cls} value={cls}>{cls}</option>
+              ))}
+            </select>
+            <select
+              value={filterStatus}
+              onChange={(e) => setFilterStatus(e.target.value)}
+              className="px-3 py-2.5 text-xs font-bold bg-slate-50 border-2 border-slate-300 rounded-2xl text-black focus:outline-none focus:border-black"
+              title="Filter status kehadiran / suara"
+            >
+              <option value="all">Semua Status</option>
+              <option value="present">Sudah Hadir</option>
+              <option value="absent">Belum Hadir</option>
+              <option value="voted">Sudah Coblos</option>
+              <option value="unvoted">Belum Coblos</option>
+            </select>
+            {(filterClass !== 'all' || filterStatus !== 'all' || searchDpt) && (
+              <button
+                type="button"
+                onClick={() => { setFilterClass('all'); setFilterStatus('all'); setSearchDpt(''); }}
+                className="px-3 py-2.5 text-xs font-black bg-white border-2 border-slate-300 rounded-2xl text-slate-700 hover:bg-slate-100"
+              >
+                Reset Filter
+              </button>
+            )}
           </div>
 
           {/* TABEL DPT PENGAWAS */}
@@ -1061,23 +1233,40 @@ export default function PemilosView() {
                       </span>
                     </td>
                     <td className="py-3.5 px-4 text-center">
-                      <button
-                        onClick={() => handleTogglePresence(v)}
-                        className={`px-3 py-1.5 rounded-xl font-black text-xs transition-all ${
-                          v.is_present
-                            ? 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
-                            : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'
-                        }`}
-                      >
-                        {v.is_present ? 'Batal Hadir' : 'Verifikasi Hadir'}
-                      </button>
+                      <div className="flex items-center justify-center gap-1.5 flex-wrap">
+                        <button
+                          onClick={() => handleTogglePresence(v)}
+                          disabled={needsLogin}
+                          className={`px-3 py-1.5 rounded-xl font-black text-xs transition-all disabled:opacity-50 ${
+                            v.is_present
+                              ? 'bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300'
+                              : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'
+                          }`}
+                        >
+                          {v.is_present ? 'Batal Hadir' : 'Verifikasi Hadir'}
+                        </button>
+                        {v.has_voted === 1 && (
+                          <button
+                            onClick={() => handleResetVoter(v.id, v.voter_name)}
+                            disabled={needsLogin}
+                            className="px-3 py-1.5 rounded-xl font-black text-xs bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-300 flex items-center gap-1 disabled:opacity-50"
+                            title="Reset hak suara agar pemilih dapat memilih ulang"
+                          >
+                            <RotateCcw className="w-3 h-3" /> Reset Suara
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
                 {voters.length === 0 && (
                   <tr>
                     <td colSpan={7} className="py-8 text-center text-slate-500 font-bold">
-                      Memuat data pemilih DPT...
+                      {votersLoading
+                        ? 'Memuat data pemilih DPT...'
+                        : needsLogin
+                          ? 'Masuk terlebih dahulu untuk memuat Daftar Pemilih Tetap.'
+                          : 'Tidak ada pemilih yang cocok dengan filter/pencarian.'}
                     </td>
                   </tr>
                 )}
@@ -1139,6 +1328,7 @@ export default function PemilosView() {
                       alt={c.pair_names}
                       className="w-14 h-14 rounded-2xl object-cover border border-slate-300 bg-white shadow-sm"
                       onError={(e) => {
+                        e.target.onerror = null;
                         e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
                       }}
                     />
@@ -1321,6 +1511,7 @@ export default function PemilosView() {
                         alt="Preview"
                         className="w-full h-full object-contain"
                         onError={(e) => {
+                          e.target.onerror = null;
                           e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
                         }}
                       />
@@ -1333,7 +1524,7 @@ export default function PemilosView() {
                     <input
                       type="file"
                       ref={editFileInputRef}
-                      onChange={(e) => handleFileUpload(e.target.files[0], 'edit')}
+                      onChange={(e) => { handleFileUpload(e.target.files?.[0], 'edit'); e.target.value = ''; }}
                       accept="image/*"
                       className="hidden"
                     />
@@ -1420,9 +1611,10 @@ export default function PemilosView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-black font-black shadow flex items-center gap-1.5"
+                  disabled={isSavingCand || isUploadingPhoto}
+                  className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-black font-black shadow flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  <Check className="w-4 h-4" /> Simpan Perubahan
+                  {isSavingCand ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Simpan Perubahan
                 </button>
               </div>
             </form>
@@ -1499,6 +1691,7 @@ export default function PemilosView() {
                         alt="Preview"
                         className="w-full h-full object-contain"
                         onError={(e) => {
+                          e.target.onerror = null;
                           e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
                         }}
                       />
@@ -1511,7 +1704,7 @@ export default function PemilosView() {
                     <input
                       type="file"
                       ref={addFileInputRef}
-                      onChange={(e) => handleFileUpload(e.target.files[0], 'add')}
+                      onChange={(e) => { handleFileUpload(e.target.files?.[0], 'add'); e.target.value = ''; }}
                       accept="image/*"
                       className="hidden"
                     />
@@ -1598,9 +1791,10 @@ export default function PemilosView() {
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-black shadow flex items-center gap-1.5"
+                  disabled={isSavingCand || isUploadingPhoto}
+                  className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-black shadow flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  <Plus className="w-4 h-4 stroke-[3]" /> Simpan Paslon
+                  {isSavingCand ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4 stroke-[3]" />} Simpan Paslon
                 </button>
               </div>
             </form>
@@ -1737,6 +1931,18 @@ export default function PemilosView() {
                 <span>Pilihan Paslon:</span>
                 <span className="font-bold text-emerald-700">No. {receiptModal.receipt.candidateNumber} ({receiptModal.receipt.candidateName})</span>
               </div>
+              {receiptModal.receipt.voterName && (
+                <div className="flex justify-between">
+                  <span>Pemilih:</span>
+                  <span className="font-bold text-black">{receiptModal.receipt.voterName}</span>
+                </div>
+              )}
+              {receiptModal.receipt.votedAt && (
+                <div className="flex justify-between">
+                  <span>Waktu:</span>
+                  <span className="font-bold text-black">{receiptModal.receipt.votedAt}</span>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-end gap-3 pt-2">

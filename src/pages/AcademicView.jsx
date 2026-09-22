@@ -1,15 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { BookOpen, Calendar, Clock, Plus, Users, School, Layers, AlertTriangle, ShieldCheck, RefreshCw } from 'lucide-react';
+import { BookOpen, Calendar, Plus, Users, School, Layers, AlertTriangle, ShieldCheck, RefreshCw } from 'lucide-react';
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan.');
+  return data;
+}
 
 export default function AcademicView() {
-  const { currentRole, showToast } = useAuth();
+  const { showToast } = useAuth();
   const [activeTab, setActiveTab] = useState('classes'); // 'classes', 'subjects', 'schedules'
   const [classes, setClasses] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [schedules, setSchedules] = useState([]);
   const [scheduleConflicts, setScheduleConflicts] = useState([]);
+  // Hasil 409 saat menyimpan jadwal baru berbentuk {...jadwal, reasons} — berbeda dari panel konflik {left, right, reasons}.
+  const [attemptConflicts, setAttemptConflicts] = useState([]);
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
+  const [isSavingClass, setIsSavingClass] = useState(false);
   const [scheduleForm, setScheduleForm] = useState({ class_id: '', subject_id: '', day: 'Senin', start_time: '07:00', end_time: '08:30', room: '' });
 
   // Form Tambah Kelas
@@ -18,42 +28,58 @@ export default function AcademicView() {
   const [newMajor, setNewMajor] = useState('MIPA');
   const [newHomeroom, setNewHomeroom] = useState('');
 
+  const loadList = (url, setter) => requestJson(url)
+    .then((data) => setter(Array.isArray(data) ? data : []))
+    .catch((error) => { setter([]); showToast(error.message, 'error'); });
+
   const loadData = () => {
-    fetch('/api/academic/classes').then(r => r.json()).then(setClasses).catch(() => {});
-    fetch('/api/academic/subjects').then(r => r.json()).then(setSubjects).catch(() => {});
-    fetch('/api/academic/schedules').then(r => r.json()).then(setSchedules).catch(() => {});
-    fetch('/api/academic/schedule-conflicts').then(r => r.json()).then((data) => setScheduleConflicts(data.conflicts || [])).catch(() => {});
+    loadList('/api/academic/classes', setClasses);
+    loadList('/api/academic/subjects', setSubjects);
+    loadList('/api/academic/schedules', setSchedules);
+    requestJson('/api/academic/schedule-conflicts')
+      .then((data) => setScheduleConflicts(Array.isArray(data.conflicts) ? data.conflicts : []))
+      .catch(() => setScheduleConflicts([]));
   };
 
   useEffect(() => {
     loadData();
   }, []);
 
-  const handleAddClass = (e) => {
+  const handleAddClass = async (e) => {
     e.preventDefault();
-    if (!newClassName) return showToast('Nama kelas wajib diisi', 'error');
+    if (!newClassName.trim()) return showToast('Nama kelas wajib diisi', 'error');
+    if (classes.some((c) => String(c.name || '').trim().toLowerCase() === newClassName.trim().toLowerCase())) {
+      return showToast('Nama kelas tersebut sudah terdaftar', 'error');
+    }
 
-    fetch('/api/academic/classes', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: newClassName,
-        grade: newGrade,
-        major: newMajor,
-        academic_year: '2024/2025',
-        homeroom_teacher_name: newHomeroom || 'Belum Ditentukan'
-      })
-    })
-      .then(r => r.json())
-      .then(data => {
-        showToast('Kelas baru berhasil ditambahkan', 'success');
-        setNewClassName('');
-        setNewHomeroom('');
-        loadData();
+    setIsSavingClass(true);
+    try {
+      const data = await requestJson('/api/academic/classes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newClassName.trim(),
+          grade: newGrade,
+          major: newMajor,
+          academic_year: '2024/2025',
+          homeroom_teacher_name: newHomeroom.trim() || 'Belum Ditentukan'
+        })
       });
+      showToast(data.message || 'Kelas baru berhasil ditambahkan', 'success');
+      setNewClassName('');
+      setNewHomeroom('');
+      loadData();
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      setIsSavingClass(false);
+    }
   };
 
-  const updateScheduleField = (event) => setScheduleForm((previous) => ({ ...previous, [event.target.name]: event.target.value }));
+  const updateScheduleField = (event) => {
+    setAttemptConflicts([]);
+    setScheduleForm((previous) => ({ ...previous, [event.target.name]: event.target.value }));
+  };
 
   const handleAddSchedule = async (event) => {
     event.preventDefault();
@@ -61,20 +87,26 @@ export default function AcademicView() {
       showToast('Pilih kelas, mata pelajaran, dan isi ruangan terlebih dahulu.', 'error');
       return;
     }
+    if (!scheduleForm.start_time || !scheduleForm.end_time || scheduleForm.start_time >= scheduleForm.end_time) {
+      showToast('Jam selesai harus lebih besar dari jam mulai.', 'error');
+      return;
+    }
     setIsSavingSchedule(true);
     try {
       const response = await fetch('/api/academic/schedules', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(scheduleForm),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...scheduleForm, class_id: Number(scheduleForm.class_id), subject_id: Number(scheduleForm.subject_id), room: scheduleForm.room.trim() }),
       });
-      const result = await response.json();
-      if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.success === false) {
         if (result.code === 'SCHEDULE_CONFLICT') {
-          setScheduleConflicts(result.conflicts || []);
-          throw new Error('Jadwal berbenturan. Periksa panel deteksi konflik.');
+          setAttemptConflicts(Array.isArray(result.conflicts) ? result.conflicts : []);
+          throw new Error(result.message || 'Jadwal berbenturan dengan jadwal yang sudah ada. Lihat rincian di bawah form.');
         }
         throw new Error(result.message || 'Jadwal tidak dapat disimpan.');
       }
-      showToast(result.message, 'success');
+      setAttemptConflicts([]);
+      showToast(result.message || 'Jadwal berhasil disimpan tanpa bentrok.', 'success');
       setScheduleForm((previous) => ({ ...previous, room: '' }));
       loadData();
     } catch (error) { showToast(error.message, 'error'); }
@@ -199,9 +231,10 @@ export default function AcademicView() {
 
               <button
                 type="submit"
-                className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20"
+                disabled={isSavingClass}
+                className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/20 disabled:opacity-60"
               >
-                Simpan Kelas
+                {isSavingClass ? 'Menyimpan…' : 'Simpan Kelas'}
               </button>
             </form>
           </div>
@@ -247,7 +280,7 @@ export default function AcademicView() {
               {scheduleConflicts.length > 0 && <div className="mt-4 space-y-2">{scheduleConflicts.map((conflict, index) => <div key={`${conflict.left.id}-${conflict.right.id}-${index}`} className="rounded-xl border border-amber-200 bg-white/80 p-3 text-xs text-amber-900"><span className="font-bold">{conflict.reasons.join(', ')}</span><span className="mt-1 block">{conflict.left.day}, {conflict.left.start_time}–{conflict.left.end_time}: {conflict.left.subject_name} ({conflict.left.class_name}) ↔ {conflict.right.subject_name} ({conflict.right.class_name})</span></div>)}</div>}
             </div>
           </div>
-          <aside className="h-fit bg-white border border-slate-200 rounded-3xl p-6"><h3 className="flex items-center gap-2 text-sm font-bold text-slate-900"><Plus className="h-4 w-4 text-emerald-500" /> Tambah jadwal</h3><p className="mt-1 text-xs leading-relaxed text-slate-500">Mata pelajaran otomatis memakai guru pengampu pada kurikulum.</p><form onSubmit={handleAddSchedule} className="mt-5 space-y-3"><label className="block text-xs font-semibold text-slate-600">Kelas<select required name="class_id" value={scheduleForm.class_id} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]"><option value="">Pilih kelas</option>{classes.map((schoolClass) => <option key={schoolClass.id} value={schoolClass.id}>{schoolClass.name}</option>)}</select></label><label className="block text-xs font-semibold text-slate-600">Mata pelajaran<select required name="subject_id" value={scheduleForm.subject_id} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]"><option value="">Pilih mata pelajaran</option>{subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name} — {subject.teacher_name}</option>)}</select></label><label className="block text-xs font-semibold text-slate-600">Hari<select name="day" value={scheduleForm.day} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]">{['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((day) => <option key={day}>{day}</option>)}</select></label><div className="grid grid-cols-2 gap-2"><label className="block text-xs font-semibold text-slate-600">Mulai<input required type="time" name="start_time" value={scheduleForm.start_time} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label><label className="block text-xs font-semibold text-slate-600">Selesai<input required type="time" name="end_time" value={scheduleForm.end_time} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label></div><label className="block text-xs font-semibold text-slate-600">Ruangan<input required name="room" value={scheduleForm.room} onChange={updateScheduleField} placeholder="Contoh: R. 102" className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label><button disabled={isSavingSchedule} className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-[#002147] px-4 py-2.5 text-xs font-bold text-white transition hover:bg-[#0a2f5c] disabled:opacity-60">{isSavingSchedule ? 'Memeriksa…' : 'Periksa & simpan jadwal'}</button></form></aside>
+          <aside className="h-fit bg-white border border-slate-200 rounded-3xl p-6"><h3 className="flex items-center gap-2 text-sm font-bold text-slate-900"><Plus className="h-4 w-4 text-emerald-500" /> Tambah jadwal</h3><p className="mt-1 text-xs leading-relaxed text-slate-500">Mata pelajaran otomatis memakai guru pengampu pada kurikulum.</p><form onSubmit={handleAddSchedule} className="mt-5 space-y-3"><label className="block text-xs font-semibold text-slate-600">Kelas<select required name="class_id" value={scheduleForm.class_id} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]"><option value="">Pilih kelas</option>{classes.map((schoolClass) => <option key={schoolClass.id} value={schoolClass.id}>{schoolClass.name}</option>)}</select></label><label className="block text-xs font-semibold text-slate-600">Mata pelajaran<select required name="subject_id" value={scheduleForm.subject_id} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]"><option value="">Pilih mata pelajaran</option>{subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name} — {subject.teacher_name}</option>)}</select></label><label className="block text-xs font-semibold text-slate-600">Hari<select name="day" value={scheduleForm.day} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-[#002147]">{['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((day) => <option key={day}>{day}</option>)}</select></label><div className="grid grid-cols-2 gap-2"><label className="block text-xs font-semibold text-slate-600">Mulai<input required type="time" name="start_time" value={scheduleForm.start_time} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label><label className="block text-xs font-semibold text-slate-600">Selesai<input required type="time" name="end_time" value={scheduleForm.end_time} onChange={updateScheduleField} className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label></div><label className="block text-xs font-semibold text-slate-600">Ruangan<input required name="room" value={scheduleForm.room} onChange={updateScheduleField} placeholder="Contoh: R. 102" className="mt-1.5 w-full rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-[#002147]" /></label><button disabled={isSavingSchedule} className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-[#002147] px-4 py-2.5 text-xs font-bold text-white transition hover:bg-[#0a2f5c] disabled:opacity-60">{isSavingSchedule ? 'Memeriksa…' : 'Periksa & simpan jadwal'}</button></form>{attemptConflicts.length > 0 && <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900"><p className="font-bold">Usulan jadwal bentrok dengan {attemptConflicts.length} jadwal yang sudah ada:</p><ul className="mt-2 space-y-1.5">{attemptConflicts.map((conflict, index) => <li key={`attempt-${conflict.id ?? index}`}><span className="font-semibold">{(conflict.reasons || []).join(', ')}</span> — {conflict.day}, {conflict.start_time}–{conflict.end_time}: {conflict.subject_name || 'Mapel'} ({conflict.class_name || 'Kelas'}){conflict.room ? `, ${conflict.room}` : ''}</li>)}</ul><p className="mt-2 text-[11px] text-amber-800">Ubah hari, jam, atau ruangan lalu periksa kembali.</p></div>}</aside>
         </div>
       )}
 

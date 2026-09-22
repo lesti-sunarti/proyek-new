@@ -1,19 +1,100 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { Receipt, DollarSign, Printer, Download, Plus, CheckCircle2, User } from 'lucide-react';
+import { Receipt, Printer, Plus, X } from 'lucide-react';
+
+const MONTHS = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+const inputClass = 'w-full bg-white border border-slate-300 rounded-xl px-3.5 py-2.5 text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-[#002147] focus:ring-1 focus:ring-[#002147] transition-all';
+const formatRp = (value) => `Rp ${Number(value || 0).toLocaleString('id-ID')}`;
+
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan.');
+  return data;
+}
+
+const buildInitialForm = () => {
+  const now = new Date();
+  return { staff_id: '', month: MONTHS[now.getMonth()], year: String(now.getFullYear()), base_salary: '', allowance: '0', teaching_fee: '0', deductions: '0' };
+};
 
 export default function PayrollView() {
-  const { showToast } = useAuth();
+  const { canAccess, showToast } = useAuth();
   const [payrolls, setPayrolls] = useState([]);
+  const [teachers, setTeachers] = useState([]);
+  const [teachersUnavailable, setTeachersUnavailable] = useState(false);
   const [selectedSlip, setSelectedSlip] = useState(null);
+  const [showGenerateModal, setShowGenerateModal] = useState(false);
+  const [form, setForm] = useState(buildInitialForm);
+  const [isSaving, setIsSaving] = useState(false);
 
   const loadPayrolls = () => {
-    fetch('/api/payroll/list').then(r => r.json()).then(setPayrolls).catch(() => {});
+    requestJson('/api/payroll/list')
+      .then((data) => setPayrolls(Array.isArray(data) ? data : []))
+      .catch((error) => { setPayrolls([]); showToast(error.message, 'error'); });
+  };
+
+  // Daftar guru/staf diambil dari buku induk; bila akun tidak punya modulnya, form generate dinonaktifkan.
+  const loadTeachers = () => {
+    if (!canAccess('buku_induk')) {
+      setTeachersUnavailable(true);
+      return;
+    }
+    requestJson('/api/master/teachers')
+      .then((data) => { setTeachers(Array.isArray(data) ? data : []); setTeachersUnavailable(false); })
+      .catch(() => { setTeachers([]); setTeachersUnavailable(true); });
   };
 
   useEffect(() => {
     loadPayrolls();
+    loadTeachers();
   }, []);
+
+  // Total payroll dihitung per periode terbaru (bukan akumulasi semua bulan).
+  const latest = payrolls[0] || null;
+  const periodPayrolls = latest ? payrolls.filter((p) => p.month === latest.month && Number(p.year) === Number(latest.year)) : [];
+  const periodTotal = periodPayrolls.reduce((sum, p) => sum + (Number(p.net_salary) || 0), 0);
+
+  const updateField = (event) => setForm((previous) => ({ ...previous, [event.target.name]: event.target.value }));
+  const netPreview = Number(form.base_salary || 0) + Number(form.allowance || 0) + Number(form.teaching_fee || 0) - Number(form.deductions || 0);
+
+  const handleGenerate = async (event) => {
+    event.preventDefault();
+    if (!form.staff_id) return showToast('Pilih guru/staf penerima gaji', 'error');
+    if (!form.month || !/^\d{4}$/.test(String(form.year))) return showToast('Periode bulan dan tahun harus valid', 'error');
+    const base = Number(form.base_salary);
+    if (!form.base_salary || !Number.isFinite(base) || base <= 0) return showToast('Gaji pokok harus lebih dari 0', 'error');
+    if ([form.allowance, form.teaching_fee, form.deductions].some((value) => value !== '' && (!Number.isFinite(Number(value)) || Number(value) < 0))) {
+      return showToast('Tunjangan, honor, dan potongan tidak boleh negatif', 'error');
+    }
+    const duplicate = payrolls.find((p) => Number(p.staff_id) === Number(form.staff_id) && p.month === form.month && Number(p.year) === Number(form.year));
+    if (duplicate) return showToast(`Slip gaji ${duplicate.staff_name} periode ${form.month} ${form.year} sudah pernah diterbitkan`, 'error');
+
+    setIsSaving(true);
+    try {
+      const data = await requestJson('/api/payroll/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          staff_id: Number(form.staff_id),
+          month: form.month,
+          year: Number(form.year),
+          base_salary: base,
+          allowance: Number(form.allowance) || 0,
+          teaching_fee: Number(form.teaching_fee) || 0,
+          deductions: Number(form.deductions) || 0,
+        }),
+      });
+      showToast(data.message || 'Slip gaji berhasil diterbitkan', 'success');
+      setShowGenerateModal(false);
+      setForm(buildInitialForm());
+      loadPayrolls();
+    } catch (error) {
+      showToast(error.message, 'error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   const handlePrintSlip = (slip) => {
     setSelectedSlip(slip);
@@ -37,10 +118,18 @@ export default function PayrollView() {
           </p>
         </div>
 
-        <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-right">
-          <div className="text-[11px] text-slate-500">Total Payroll Bulan Ini:</div>
-          <div className="text-base font-extrabold text-emerald-400">
-            Rp {payrolls.reduce((sum, p) => sum + Number(p.net_salary), 0).toLocaleString('id-ID')}
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+          <button
+            onClick={() => setShowGenerateModal(true)}
+            className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20 flex items-center gap-1.5"
+          >
+            <Plus className="w-4 h-4" /> Terbitkan Slip Gaji
+          </button>
+          <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-right">
+            <div className="text-[11px] text-slate-500">{latest ? `Total Payroll ${latest.month} ${latest.year}:` : 'Total Payroll:'}</div>
+            <div className="text-base font-extrabold text-emerald-400">
+              {formatRp(periodTotal)}
+            </div>
           </div>
         </div>
       </div>
@@ -51,7 +140,7 @@ export default function PayrollView() {
           <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
             <Receipt className="w-4 h-4 text-emerald-400" /> Daftar Slip Gaji Terbit
           </h3>
-          <span className="text-xs text-slate-500">{payrolls.length} Pegawai</span>
+          <span className="text-xs text-slate-500">{payrolls.length} Slip</span>
         </div>
 
         <div className="overflow-x-auto">
@@ -69,20 +158,23 @@ export default function PayrollView() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200">
+              {payrolls.length === 0 && (
+                <tr><td colSpan={8} className="py-8 text-center text-slate-400">Belum ada slip gaji yang diterbitkan.</td></tr>
+              )}
               {payrolls.map((p) => (
                 <tr key={p.id} className="hover:bg-slate-50">
                   <td className="py-3 px-4 font-bold text-slate-900">{p.staff_name}</td>
                   <td className="py-3 px-4 text-slate-500">{p.staff_role}</td>
-                  <td className="py-3 px-4 font-medium text-emerald-300">{p.month} {p.year}</td>
-                  <td className="py-3 px-4 font-mono">Rp {Number(p.base_salary).toLocaleString('id-ID')}</td>
+                  <td className="py-3 px-4 font-medium text-emerald-600">{p.month} {p.year}</td>
+                  <td className="py-3 px-4 font-mono">{formatRp(p.base_salary)}</td>
                   <td className="py-3 px-4 font-mono text-emerald-400">
-                    +Rp {(Number(p.allowance) + Number(p.teaching_fee)).toLocaleString('id-ID')}
+                    +{formatRp((Number(p.allowance) || 0) + (Number(p.teaching_fee) || 0))}
                   </td>
                   <td className="py-3 px-4 font-mono text-rose-400">
-                    -Rp {Number(p.deductions).toLocaleString('id-ID')}
+                    -{formatRp(p.deductions)}
                   </td>
-                  <td className="py-3 px-4 font-mono font-bold text-sm text-white">
-                    Rp {Number(p.net_salary).toLocaleString('id-ID')}
+                  <td className="py-3 px-4 font-mono font-bold text-sm text-slate-900">
+                    {formatRp(p.net_salary)}
                   </td>
                   <td className="py-3 px-4 text-center">
                     <button
@@ -98,6 +190,76 @@ export default function PayrollView() {
           </table>
         </div>
       </div>
+
+      {/* Modal Terbitkan Slip Gaji */}
+      {showGenerateModal && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white border border-slate-200 rounded-3xl p-6 max-w-md w-full space-y-4 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Terbitkan Slip Gaji Baru</h3>
+                <p className="text-xs text-slate-500 mt-0.5">Gaji bersih otomatis dicatat sebagai pengeluaran kas di modul Keuangan.</p>
+              </div>
+              <button type="button" onClick={() => setShowGenerateModal(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100" aria-label="Tutup form"><X className="w-4 h-4" /></button>
+            </div>
+
+            {teachersUnavailable && (
+              <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                Daftar guru/staf (Buku Induk) tidak tersedia untuk akun ini, sehingga slip belum dapat diterbitkan.
+              </div>
+            )}
+
+            <form onSubmit={handleGenerate} className="space-y-3">
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Guru / Staf Penerima *</label>
+                <select name="staff_id" value={form.staff_id} onChange={updateField} className={inputClass} disabled={teachersUnavailable}>
+                  <option value="">Pilih guru / staf</option>
+                  {teachers.map((t) => <option key={t.id} value={t.id}>{t.name} — {t.position || 'Guru Pengajar'}</option>)}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Bulan</label>
+                  <select name="month" value={form.month} onChange={updateField} className={inputClass}>
+                    {MONTHS.map((month) => <option key={month} value={month}>{month}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Tahun</label>
+                  <input type="number" name="year" min="2000" max="2100" value={form.year} onChange={updateField} className={inputClass} />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Gaji Pokok (Rp) *</label>
+                <input type="number" name="base_salary" min="1" step="1000" placeholder="Contoh: 4500000" value={form.base_salary} onChange={updateField} className={inputClass} />
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Tunjangan</label>
+                  <input type="number" name="allowance" min="0" step="1000" value={form.allowance} onChange={updateField} className={inputClass} />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Honor Mengajar</label>
+                  <input type="number" name="teaching_fee" min="0" step="1000" value={form.teaching_fee} onChange={updateField} className={inputClass} />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Potongan</label>
+                  <input type="number" name="deductions" min="0" step="1000" value={form.deductions} onChange={updateField} className={inputClass} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between rounded-xl bg-slate-50 border border-slate-200 px-3.5 py-2.5 text-xs">
+                <span className="text-slate-500 font-semibold">Gaji Bersih (Net):</span>
+                <span className={`font-mono font-bold text-sm ${netPreview < 0 ? 'text-rose-500' : 'text-slate-900'}`}>{formatRp(netPreview)}</span>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button type="button" onClick={() => setShowGenerateModal(false)} className="flex-1 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs font-semibold">Batal</button>
+                <button type="submit" disabled={isSaving || teachersUnavailable} className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-60">{isSaving ? 'Menerbitkan…' : 'Terbitkan Slip'}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Printable Pay Slip Template */}
       {selectedSlip && (
@@ -120,22 +282,22 @@ export default function PayrollView() {
             </div>
             <div className="flex justify-between">
               <span>Tanggal Pembayaran:</span>
-              <span>{selectedSlip.paid_at}</span>
+              <span>{selectedSlip.paid_at || '-'}</span>
             </div>
 
             <div className="pt-2 border-t border-slate-300">
               <div className="font-bold mb-1">Rincian Penghasilan:</div>
               <div className="flex justify-between py-0.5">
                 <span>- Gaji Pokok:</span>
-                <span>Rp {Number(selectedSlip.base_salary).toLocaleString('id-ID')}</span>
+                <span>{formatRp(selectedSlip.base_salary)}</span>
               </div>
               <div className="flex justify-between py-0.5">
                 <span>- Tunjangan Fungsional:</span>
-                <span>Rp {Number(selectedSlip.allowance).toLocaleString('id-ID')}</span>
+                <span>{formatRp(selectedSlip.allowance)}</span>
               </div>
               <div className="flex justify-between py-0.5">
                 <span>- Honor Jam Mengajar & Tambahan:</span>
-                <span>Rp {Number(selectedSlip.teaching_fee).toLocaleString('id-ID')}</span>
+                <span>{formatRp(selectedSlip.teaching_fee)}</span>
               </div>
             </div>
 
@@ -143,13 +305,13 @@ export default function PayrollView() {
               <div className="font-bold mb-1">Potongan:</div>
               <div className="flex justify-between py-0.5 text-red-600">
                 <span>- Potongan Absensi & Keterlambatan:</span>
-                <span>Rp {Number(selectedSlip.deductions).toLocaleString('id-ID')}</span>
+                <span>{formatRp(selectedSlip.deductions)}</span>
               </div>
             </div>
 
             <div className="pt-3 border-t-2 border-black flex justify-between font-bold text-sm">
               <span>TOTAL DITERIMA (NET):</span>
-              <span>Rp {Number(selectedSlip.net_salary).toLocaleString('id-ID')}</span>
+              <span>{formatRp(selectedSlip.net_salary)}</span>
             </div>
           </div>
 

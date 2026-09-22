@@ -10,6 +10,10 @@
 - Aktivitas autentikasi, operasi ubah data, penolakan akses, dan pembukaan data BK dicatat pada audit log.
 - Student Timeline menyaring nilai dan catatan pembinaan di API; akses catatan pembinaan menghasilkan audit entry tambahan.
 - Header dasar `nosniff`, frame protection, referrer policy, serta permission policy diterapkan.
+- Data pribadi (tagihan SPP, riwayat presensi, nilai, izin/UKS, dompet, mutasi, pesanan kantin, jawaban tugas) untuk akun siswa/orang tua dibatasi di server hanya ke siswa yang terkait dengan akun tersebut; aksi pengelolaan (produk kantin, paket ujian, penilaian, tindak lanjut aspirasi/izin) hanya untuk akun staf.
+- Operasi tulis multi-langkah (pembayaran SPP, penggajian, pesanan kantin, top-up/transfer dompet, e-voting, peminjaman/pengembalian buku) berjalan dalam transaksi SQLite sehingga tidak ada data setengah jadi.
+- Harga dan stok pesanan kantin dihitung ulang dari database (bukan dari klien); saldo dompet diperiksa ulang di dalam transaksi.
+- Validasi input server mengembalikan 400 (data tidak valid), 404 (tidak ditemukan), dan 409 (duplikat) dengan pesan yang jelas; error constraint SQLite tidak lagi bocor sebagai 500.
 
 ## Pengoperasian produksi
 

@@ -15,13 +15,26 @@ import {
 import { useAuth } from '../context/AuthContext';
 
 const categories = ['Semua', 'Pembelajaran', 'Fasilitas', 'Kegiatan', 'Keamanan', 'Kesejahteraan', 'Lainnya'];
+const STATUS_OPTIONS = ['baru', 'ditinjau', 'ditindaklanjuti', 'selesai'];
+const EMPTY_SUMMARY = { total: 0, statusCounts: [], categoryCounts: [] };
+
+// Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
+const fetchJson = async (url, options) => {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal memproses permintaan');
+  return data;
+};
 
 export default function FeedbackView() {
   const { currentUser, currentRole, isStaff, showToast } = useAuth();
   const [feedbackList, setFeedbackList] = useState([]);
-  const [summary, setSummary] = useState({ total: 0, statusCounts: [], categoryCounts: [] });
+  const [summary, setSummary] = useState(EMPTY_SUMMARY);
+  const [loadError, setLoadError] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Semua');
+  const [selectedStatus, setSelectedStatus] = useState('semua');
   const [loading, setLoading] = useState(false);
+  const [updatingId, setUpdatingId] = useState(null);
 
   // Form State
   const [subject, setSubject] = useState('');
@@ -30,78 +43,95 @@ export default function FeedbackView() {
   const [isAnonymous, setIsAnonymous] = useState(true);
 
   const fetchFeedback = () => {
-    fetch('/api/feedback')
-      .then(res => res.json())
-      .then(data => setFeedbackList(data))
-      .catch(() => {});
+    fetchJson('/api/feedback?limit=100')
+      .then(data => { setFeedbackList(Array.isArray(data) ? data : []); setLoadError(''); })
+      .catch(err => { setFeedbackList([]); setLoadError(err.message || 'Daftar aspirasi tidak dapat dimuat.'); });
 
-    fetch('/api/feedback/summary')
-      .then(res => res.json())
-      .then(data => setSummary(data))
-      .catch(() => {});
+    // Ringkasan berbentuk objek {total, statusCounts:[{status,count}], categoryCounts:[{category,count}]}
+    fetchJson('/api/feedback/summary')
+      .then(data => setSummary({
+        total: Number(data?.total) || 0,
+        statusCounts: Array.isArray(data?.statusCounts) ? data.statusCounts : [],
+        categoryCounts: Array.isArray(data?.categoryCounts) ? data.categoryCounts : [],
+      }))
+      .catch(() => setSummary(EMPTY_SUMMARY));
   };
 
   useEffect(() => {
     fetchFeedback();
   }, []);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!subject.trim() || !message.trim()) {
+    if (loading) return;
+    const cleanSubject = subject.trim();
+    const cleanMessage = message.trim();
+    if (!cleanSubject || !cleanMessage) {
       showToast('Mohon isi topik dan pesan aspirasi Anda.', 'error');
+      return;
+    }
+    if (cleanSubject.length > 180 || cleanMessage.length > 3000) {
+      showToast('Topik maksimal 180 karakter dan isi aspirasi maksimal 3000 karakter.', 'error');
       return;
     }
 
     setLoading(true);
-    fetch('/api/feedback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sender_name: isAnonymous ? '' : currentUser.name,
-        sender_role: currentRole,
-        is_anonymous: isAnonymous,
-        category,
-        subject: subject.trim(),
-        message: message.trim()
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        setLoading(false);
-        if (data.success) {
-          showToast(data.message || 'Aspirasi berhasil dikirimkan!', 'success');
-          setSubject('');
-          setMessage('');
-          fetchFeedback();
-        } else {
-          showToast(data.message || 'Gagal mengirim aspirasi', 'error');
-        }
-      })
-      .catch(() => {
-        setLoading(false);
-        showToast('Terjadi kesalahan saat mengirim aspirasi.', 'error');
+    try {
+      const data = await fetchJson('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sender_name: isAnonymous ? '' : currentUser.name,
+          sender_role: currentRole,
+          is_anonymous: isAnonymous,
+          category,
+          subject: cleanSubject,
+          message: cleanMessage
+        })
       });
+      const code = data.feedback?.submission_code;
+      showToast(`${data.message || 'Aspirasi berhasil dikirimkan!'}${code ? ` Kode: ${code}` : ''}`, 'success');
+      setSubject('');
+      setMessage('');
+      fetchFeedback();
+    } catch (err) {
+      showToast(err.message || 'Terjadi kesalahan saat mengirim aspirasi.', 'error');
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleUpdateStatus = (id, newStatus) => {
-    fetch(`/api/feedback/${id}/status`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: newStatus })
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.success) {
-          showToast('Status aspirasi berhasil diperbarui', 'success');
-          fetchFeedback();
-        }
-      })
-      .catch(() => showToast('Gagal memperbarui status', 'error'));
+  const handleUpdateStatus = async (id, newStatus) => {
+    const target = feedbackList.find(item => item.id === id);
+    if (!target || target.status === newStatus || updatingId) return;
+    setUpdatingId(id);
+    try {
+      const data = await fetchJson(`/api/feedback/${id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: newStatus })
+      });
+      showToast(data.message || 'Status aspirasi berhasil diperbarui', 'success');
+      fetchFeedback();
+    } catch (err) {
+      showToast(err.message || 'Gagal memperbarui status', 'error');
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  // Angka ringkasan memakai data server (seluruh aspirasi), bukan hanya daftar yang dimuat.
+  const statusCount = (...statuses) => {
+    if (summary.statusCounts.length) {
+      return summary.statusCounts.filter(item => statuses.includes(item.status)).reduce((acc, item) => acc + (Number(item.count) || 0), 0);
+    }
+    return feedbackList.filter(item => statuses.includes(item.status)).length;
   };
 
   const filteredList = feedbackList.filter(item => {
-    if (selectedCategory === 'Semua') return true;
-    return item.category === selectedCategory;
+    const matchCategory = selectedCategory === 'Semua' || item.category === selectedCategory;
+    const matchStatus = selectedStatus === 'semua' || item.status === selectedStatus;
+    return matchCategory && matchStatus;
   });
 
   const getStatusBadge = (status) => {
@@ -151,21 +181,21 @@ export default function FeedbackView() {
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
           <div className="text-[10px] font-bold uppercase text-slate-400">Sedang Ditinjau</div>
           <div className="text-xl font-black text-amber-600 mt-1">
-            {feedbackList.filter(f => f.status === 'ditinjau' || f.status === 'baru').length}
+            {statusCount('baru', 'ditinjau')}
           </div>
           <div className="text-[10px] text-amber-700 mt-0.5">Menunggu respon pengelola</div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
           <div className="text-[10px] font-bold uppercase text-slate-400">Ditindaklanjuti</div>
           <div className="text-xl font-black text-indigo-600 mt-1">
-            {feedbackList.filter(f => f.status === 'ditindaklanjuti').length}
+            {statusCount('ditindaklanjuti')}
           </div>
           <div className="text-[10px] text-indigo-700 mt-0.5">Proses perbaikan/tindakan</div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
           <div className="text-[10px] font-bold uppercase text-slate-400">Terselesaikan</div>
           <div className="text-xl font-black text-emerald-600 mt-1">
-            {feedbackList.filter(f => f.status === 'selesai').length}
+            {statusCount('selesai')}
           </div>
           <div className="text-[10px] text-emerald-700 mt-0.5">Solusi telah diterapkan</div>
         </div>
@@ -243,7 +273,7 @@ export default function FeedbackView() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full py-2.5 px-4 rounded-xl bg-[#002147] hover:bg-[#0a2f5c] text-white font-bold text-xs shadow-xs transition-colors flex items-center justify-center gap-2"
+              className="w-full py-2.5 px-4 rounded-xl bg-[#002147] hover:bg-[#0a2f5c] disabled:opacity-60 text-white font-bold text-xs shadow-xs transition-colors flex items-center justify-center gap-2"
             >
               <Send className="w-4 h-4 text-[#f4a024]" />
               {loading ? 'Mengirimkan...' : 'Kirimkan Aspirasi Sekarang'}
@@ -272,7 +302,19 @@ export default function FeedbackView() {
                 {cat}
               </button>
             ))}
+            <select
+              value={selectedStatus}
+              onChange={(e) => setSelectedStatus(e.target.value)}
+              className="ml-auto text-xs border border-slate-200 rounded-full px-3 py-1 bg-white text-slate-600 font-semibold"
+            >
+              <option value="semua">Semua Status</option>
+              {STATUS_OPTIONS.map((st) => <option key={st} value={st}>{st}</option>)}
+            </select>
           </div>
+
+          {loadError && (
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold">{loadError}</div>
+          )}
 
           {/* LIST */}
           <div className="space-y-3">
@@ -320,8 +362,9 @@ export default function FeedbackView() {
                         {['ditinjau', 'ditindaklanjuti', 'selesai'].map((st) => (
                           <button
                             key={st}
+                            disabled={updatingId === item.id || item.status === st}
                             onClick={() => handleUpdateStatus(item.id, st)}
-                            className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
+                            className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition-colors disabled:cursor-default ${
                               item.status === st
                                 ? 'bg-[#002147] text-white border-[#002147]'
                                 : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
