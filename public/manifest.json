@@ -1,0 +1,18 @@
+{
+  "name": "Sekolah Super App & CBT",
+  "short_name": "SekolahApp",
+  "description": "Sistem Informasi Manajemen Sekolah Terpadu & CBT Anti-Nyontek",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#16a34a",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

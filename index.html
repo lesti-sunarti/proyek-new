@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#002147" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="description" content="Portal layanan dan sistem informasi terpadu SMAN 1 Harapan Bangsa." />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.json" />
+    <title>SMAN 1 Harapan Bangsa | Sistem Sekolah Terpadu & CBT Online</title>
+    <!-- Google Font Poppins (SMK Tunas Media Standard) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-[#f8fafc] text-[#334155] antialiased" style="font-family: 'Poppins', sans-serif;">
+    <div id="root"></div>
+
+    <!-- Script auto-recovery pembaruan bundle & cache stale -->
+    <script>
+      window.addEventListener('error', function(e) {
+        var msg = (e && e.message) ? e.message.toLowerCase() : '';
+        if (msg.includes('loading chunk') || msg.includes('failed to fetch') || msg.includes('unexpected token') || msg.includes('dynamically imported module')) {
+          var hasReloaded = sessionStorage.getItem('app_auto_reloaded');
+          if (!hasReloaded) {
+            sessionStorage.setItem('app_auto_reloaded', '1');
+            if ('caches' in window) {
+              caches.keys().then(function(names) {
+                names.forEach(function(name) { caches.delete(name); });
+              });
+            }
+            window.location.reload();
+          }
+        }
+      });
+      window.addEventListener('load', function() {
+        sessionStorage.removeItem('app_auto_reloaded');
+      });
+    </script>
+
+    <script type="module" src="/src/main.jsx"></script>
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch(err => {
+            console.log('SW registration note:', err);
+          });
+        });
+      }
+    </script>
+  </body>
+</html>

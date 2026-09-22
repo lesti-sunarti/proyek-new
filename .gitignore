@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+.cache/
+school.db
+school.db-wal
+school.db-shm
+.env
+*.log
