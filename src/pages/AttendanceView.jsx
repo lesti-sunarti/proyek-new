@@ -18,12 +18,19 @@ import {
   TrendingUp,
   RefreshCw,
   UserRoundCheck,
-  AlertTriangle
+  AlertTriangle,
+  Info
 } from 'lucide-react';
 import QRModal from '../components/QRModal';
 
 const DEFAULT_LATE_CUTOFF = '07:15:00';
 const METHOD_LABELS = { self_scan: '📱 HP Mandiri', kiosk_card: '💳 Kiosk Kartu', manual: '⌨️ Input Manual' };
+
+// Pemindaian QR memakai BarcodeDetector bawaan browser (tanpa dependensi tambahan).
+const hasBarcodeDetector = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+const SCAN_INTERVAL_MS = 300;        // jeda antar deteksi frame video
+const SCAN_RESUME_DELAY_MS = 3000;   // jeda sebelum pemindaian dilanjutkan setelah kode terdeteksi
+const SAME_CODE_COOLDOWN_MS = 10000; // kode yang sama tidak dikirim ulang dalam rentang ini
 
 // Pola fetch standar: lempar Error berisi pesan server untuk respons non-OK.
 const fetchJson = async (url, options) => {
@@ -57,8 +64,21 @@ export default function AttendanceView() {
   const streamRef = useRef(null);
   const loadingRef = useRef(false);
 
-  // Akun siswa/ortu terhubung ke satu siswa; dipakai untuk riwayat pribadi & QR kartu pelajar.
-  const relatedStudentId = (currentRole === 'siswa' || currentRole === 'ortu') ? (currentUser.related_student_id || null) : null;
+  // Pemindai QR (BarcodeDetector): loop deteksi, jeda lanjut, dan kode terakhir yang terdeteksi.
+  const detectorRef = useRef(null);
+  const scanIntervalRef = useRef(null);
+  const resumeTimeoutRef = useRef(null);
+  const detectingRef = useRef(false);
+  const lastDetectedRef = useRef({ code: null, at: 0 });
+  const scanHandlerRef = useRef(null); // handler scan terbaru agar loop tidak memakai closure lama
+  const [scanStatus, setScanStatus] = useState('idle'); // 'idle' | 'scanning' | 'detected' | 'cooldown' | 'unsupported'
+  const [detectedCode, setDetectedCode] = useState('');
+
+  // Akun siswa/ortu terhubung ke satu siswa (currentUser.student dari sesi login);
+  // dipakai untuk riwayat pribadi & QR kartu pelajar. related_student_id hanya fallback akun lama.
+  const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  const linkedStudent = isStudentAccount && currentUser.student ? currentUser.student : null;
+  const relatedStudentId = isStudentAccount ? (linkedStudent?.id || currentUser.related_student_id || null) : null;
 
   const fetchLogs = () => {
     fetchJson('/api/attendance/today')
@@ -67,7 +87,7 @@ export default function AttendanceView() {
   };
 
   const fetchMyHistory = () => {
-    if (!relatedStudentId) return;
+    if (!relatedStudentId) { setMyHistory([]); return; }
     fetchJson(`/api/attendance/history?person_id=${relatedStudentId}&user_type=siswa&limit=10`)
       .then(data => setMyHistory(Array.isArray(data) ? data : []))
       .catch(() => setMyHistory([]));
@@ -81,12 +101,76 @@ export default function AttendanceView() {
       .finally(() => setIsIntelligenceLoading(false));
   };
 
+  // ===== Pemindai QR dari video kamera (window.BarcodeDetector) =====
+  const stopDetectionLoop = () => {
+    if (scanIntervalRef.current) { clearInterval(scanIntervalRef.current); scanIntervalRef.current = null; }
+    if (resumeTimeoutRef.current) { clearTimeout(resumeTimeoutRef.current); resumeTimeoutRef.current = null; }
+    detectingRef.current = false;
+  };
+
+  const getDetector = () => {
+    if (detectorRef.current) return detectorRef.current;
+    if (!hasBarcodeDetector) return null;
+    try {
+      detectorRef.current = new window.BarcodeDetector({ formats: ['qr_code'] });
+    } catch {
+      // Sebagian browser menolak daftar format tertentu; coba tanpa opsi sebelum menyerah.
+      try { detectorRef.current = new window.BarcodeDetector(); } catch { detectorRef.current = null; }
+    }
+    return detectorRef.current;
+  };
+
+  // Kode terdeteksi: jeda loop, isi input QR, kirim lewat handler scan yang ada, lalu lanjutkan ±3 detik kemudian.
+  const handleDetectedCode = async (code) => {
+    const now = Date.now();
+    const last = lastDetectedRef.current;
+    if (last.code === code && now - last.at < SAME_CODE_COOLDOWN_MS) return; // kode sama dalam 10 detik: abaikan
+    if (loadingRef.current) return; // scan lain (manual/preset) masih diproses
+    lastDetectedRef.current = { code, at: now };
+    if (scanIntervalRef.current) { clearInterval(scanIntervalRef.current); scanIntervalRef.current = null; }
+    setDetectedCode(code);
+    setScanStatus('detected');
+    setManualCode(code);
+    try {
+      if (scanHandlerRef.current) await scanHandlerRef.current(code);
+    } finally {
+      // Lanjutkan pemindaian hanya bila kamera masih aktif (belum dimatikan/unmount).
+      if (streamRef.current) {
+        setScanStatus('cooldown');
+        resumeTimeoutRef.current = setTimeout(() => {
+          resumeTimeoutRef.current = null;
+          if (streamRef.current) startDetectionLoop();
+        }, SCAN_RESUME_DELAY_MS);
+      }
+    }
+  };
+
+  const startDetectionLoop = () => {
+    const detector = getDetector();
+    if (!detector) { setScanStatus('unsupported'); return; }
+    stopDetectionLoop();
+    setScanStatus('scanning');
+    scanIntervalRef.current = setInterval(() => {
+      const video = videoRef.current;
+      // Deteksi hanya saat frame video sudah tersedia (readyState >= 2) dan tidak ada deteksi lain yang berjalan.
+      if (!video || video.readyState < 2 || detectingRef.current || !scanIntervalRef.current) return;
+      detectingRef.current = true;
+      detector.detect(video)
+        .then((codes) => {
+          const raw = Array.isArray(codes) ? codes.find(c => c && c.rawValue)?.rawValue : null;
+          if (raw && scanIntervalRef.current) handleDetectedCode(String(raw).trim());
+        })
+        .catch(() => {}) // frame belum siap / decoder gagal: coba lagi pada tick berikutnya
+        .finally(() => { detectingRef.current = false; });
+    }, SCAN_INTERVAL_MS);
+  };
+
   useEffect(() => {
     fetchLogs();
     fetchIntelligence();
-    fetchMyHistory();
     return () => {
-      // Pastikan kamera dimatikan saat komponen dilepas (unmount).
+      // Pastikan loop pemindaian & kamera dimatikan saat komponen dilepas (unmount).
+      stopDetectionLoop();
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
         streamRef.current = null;
@@ -94,13 +178,21 @@ export default function AttendanceView() {
     };
   }, []);
 
+  // Riwayat pribadi mengikuti siswa yang terhubung dengan akun (ikut berubah saat login/logout).
+  useEffect(() => {
+    fetchMyHistory();
+  }, [relatedStudentId]);
+
   // Elemen <video> baru dirender setelah isCameraActive = true, jadi stream dipasang di sini
-  // (bukan di startCamera, saat videoRef.current masih null).
+  // (bukan di startCamera, saat videoRef.current masih null). Loop pemindaian QR ikut dimulai di sini.
   useEffect(() => {
     if (!isCameraActive || !videoRef.current || !streamRef.current) return;
     videoRef.current.srcObject = streamRef.current;
     const playPromise = videoRef.current.play();
     if (playPromise && typeof playPromise.catch === 'function') playPromise.catch(() => {});
+    if (hasBarcodeDetector) startDetectionLoop();
+    else setScanStatus('unsupported');
+    return () => stopDetectionLoop();
   }, [isCameraActive]);
 
   const startCamera = async () => {
@@ -122,12 +214,15 @@ export default function AttendanceView() {
   };
 
   const stopCamera = () => {
+    stopDetectionLoop();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
     if (videoRef.current) videoRef.current.srcObject = null;
     setIsCameraActive(false);
+    setScanStatus('idle');
+    setDetectedCode('');
   };
 
   const handleScanSubmit = async (codeToScan) => {
@@ -153,12 +248,19 @@ export default function AttendanceView() {
         })
       });
       const record = data.record || null;
-      showToast(data.message || 'Presensi berhasil dicatat.', record?.is_late ? 'info' : 'success');
-      setLastScanResult(record ? { ...record, type: attendanceType } : null);
+      // Scan ganda masuk/pulang di hari yang sama: server menjawab 200 + already_recorded (info, bukan error).
+      const alreadyRecorded = data.already_recorded === true;
+      showToast(
+        data.message || (alreadyRecorded ? 'Presensi sudah tercatat sebelumnya hari ini.' : 'Presensi berhasil dicatat.'),
+        alreadyRecorded || record?.is_late ? 'info' : 'success'
+      );
+      setLastScanResult(record ? { ...record, type: record.type || attendanceType, already_recorded: alreadyRecorded } : null);
       setManualCode('');
-      fetchLogs();
-      fetchIntelligence();
-      fetchMyHistory();
+      if (!alreadyRecorded) {
+        fetchLogs();
+        fetchIntelligence();
+        fetchMyHistory();
+      }
     } catch (err) {
       showToast(err.message || 'Gagal memproses absensi', 'error');
     } finally {
@@ -166,6 +268,11 @@ export default function AttendanceView() {
       setLoading(false);
     }
   };
+
+  // Loop pemindaian memanggil handler lewat ref supaya selalu memakai tipe presensi/mode/mapel terbaru.
+  useEffect(() => {
+    scanHandlerRef.current = handleScanSubmit;
+  });
 
   const lateCutoff = intelligence?.late_cutoff || DEFAULT_LATE_CUTOFF;
   // Aturan yang sama dengan server: siswa, tipe masuk, hadir, lewat batas waktu.
@@ -190,11 +297,17 @@ export default function AttendanceView() {
   const insightClasses = Array.isArray(intelligence?.classes) ? intelligence.classes : [];
   const insightFollowups = Array.isArray(intelligence?.followups) ? intelligence.followups : [];
 
-  // QR kartu pelajar diturunkan dari identitas (NISN) pada catatan presensi milik siswa yang login.
-  const myIdentifier = myHistory.find(item => item.person_identifier)?.person_identifier
+  // QR kartu pelajar: sumber utama data siswa terhubung dari sesi login (qr_code, nama, NISN, kelas);
+  // fallback ke identitas (NISN) pada catatan presensi bila sesi belum membawa objek student.
+  const historyIdentifier = myHistory.find(item => item.person_identifier)?.person_identifier
     || todayLogs.find(item => item.user_type === 'siswa' && item.person_id === relatedStudentId)?.person_identifier
     || null;
-  const myQrValue = myIdentifier ? `SISWA-${myIdentifier}` : null;
+  const myIdentifier = linkedStudent?.nisn || historyIdentifier;
+  const myQrValue = linkedStudent?.qr_code || (myIdentifier ? `SISWA-${myIdentifier}` : null);
+  const myStudentName = linkedStudent?.name
+    || myHistory.find(item => item.person_name)?.person_name
+    || (currentRole === 'siswa' ? currentUser.name : null);
+  const myClassName = linkedStudent?.class_name || null;
 
   return (
     <div className="space-y-6">
@@ -314,8 +427,23 @@ export default function AttendanceView() {
                 <div className="w-full max-w-sm space-y-3">
                   <div className="relative rounded-2xl overflow-hidden aspect-video bg-black border border-emerald-500/50 shadow-xl">
                     <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-                    <div className="absolute inset-0 border-2 border-emerald-400/60 rounded-2xl pointer-events-none animate-pulse"></div>
+                    <div className={`absolute inset-0 border-2 rounded-2xl pointer-events-none ${scanStatus === 'detected' ? 'border-amber-400' : scanStatus === 'scanning' ? 'border-emerald-400/60 animate-pulse' : 'border-slate-400/50'}`}></div>
                   </div>
+                  {/* Status pemindaian QR (BarcodeDetector) */}
+                  {scanStatus === 'unsupported' ? (
+                    <div className="p-2.5 rounded-xl bg-sky-50 border border-sky-200 text-[11px] text-sky-900 flex items-start gap-2 text-left">
+                      <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>Browser ini belum mendukung pemindaian QR otomatis dari kamera (BarcodeDetector). Kamera hanya sebagai pratinjau; gunakan input manual / barcode reader kiosk di bawah.</span>
+                    </div>
+                  ) : (
+                    <p className={`text-[11px] font-semibold ${scanStatus === 'detected' ? 'text-amber-700' : scanStatus === 'cooldown' ? 'text-slate-500' : 'text-emerald-700'}`}>
+                      {scanStatus === 'detected'
+                        ? `QR terdeteksi: ${detectedCode} — memproses presensi…`
+                        : scanStatus === 'cooldown'
+                          ? 'Presensi diproses. Pemindaian dilanjutkan dalam 3 detik…'
+                          : 'Memindai QR Code… arahkan kode ke dalam bingkai kamera.'}
+                    </p>
+                  )}
                   <button
                     onClick={stopCamera}
                     className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-100 text-rose-400 text-xs font-semibold flex items-center gap-1.5 mx-auto"
@@ -333,6 +461,9 @@ export default function AttendanceView() {
                     {scanMode === 'self_scan' 
                       ? 'Nyalakan kamera ponsel atau gunakan tap cepat di bawah untuk simulasi presensi instan.' 
                       : 'Arahkan Kartu Pelajar ber-barcode siswa ke arah webcam kiosk gerbang.'}
+                    {!hasBarcodeDetector && (
+                      <span className="block mt-1 text-sky-800">Browser ini belum mendukung pemindaian QR otomatis; kamera hanya pratinjau, presensi lewat input manual / barcode reader kiosk.</span>
+                    )}
                   </p>
                   <button
                     onClick={startCamera}
@@ -400,17 +531,19 @@ export default function AttendanceView() {
               </h3>
 
               {lastScanResult ? (
-                <div className={`p-4 rounded-2xl border space-y-3 animate-in zoom-in-95 duration-150 ${lastScanResult.is_late ? 'bg-amber-50 border-amber-300' : 'bg-emerald-50 border-emerald-500/30'}`}>
+                <div className={`p-4 rounded-2xl border space-y-3 animate-in zoom-in-95 duration-150 ${lastScanResult.already_recorded ? 'bg-sky-50 border-sky-200' : lastScanResult.is_late ? 'bg-amber-50 border-amber-300' : 'bg-emerald-50 border-emerald-500/30'}`}>
                   <div className="flex items-center justify-between">
-                    <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded flex items-center gap-1 ${lastScanResult.is_late ? 'bg-amber-200 text-amber-900' : 'bg-emerald-500/20 text-emerald-700'}`}>
-                      {lastScanResult.is_late ? <><AlertTriangle className="w-3 h-3" /> Terlambat - perlu verifikasi</> : 'Presensi Sukses'}
+                    <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded flex items-center gap-1 ${lastScanResult.already_recorded ? 'bg-sky-200 text-sky-900' : lastScanResult.is_late ? 'bg-amber-200 text-amber-900' : 'bg-emerald-500/20 text-emerald-700'}`}>
+                      {lastScanResult.already_recorded
+                        ? <><Info className="w-3 h-3" /> Sudah tercatat hari ini</>
+                        : lastScanResult.is_late ? <><AlertTriangle className="w-3 h-3" /> Terlambat - perlu verifikasi</> : 'Presensi Sukses'}
                     </span>
                     <span className="text-xs font-mono text-emerald-700">{lastScanResult.time} WIB</span>
                   </div>
                   <div>
                     <div className="text-base font-extrabold text-slate-900">{lastScanResult.person_name}</div>
                     <div className="text-xs text-slate-600 capitalize">
-                      Status: {lastScanResult.user_type} - {lastScanResult.is_late ? `Hadir (melewati batas ${lateCutoff.slice(0, 5)})` : 'Hadir'}{lastScanResult.type ? ` • ${lastScanResult.type}` : ''}
+                      Status: {lastScanResult.user_type} - {lastScanResult.is_late ? `Hadir (melewati batas ${lateCutoff.slice(0, 5)})` : 'Hadir'}{lastScanResult.type ? ` • ${lastScanResult.type}` : ''}{lastScanResult.already_recorded ? ' • tidak dicatat ulang' : ''}
                     </div>
                   </div>
 
@@ -427,10 +560,16 @@ export default function AttendanceView() {
                 </div>
               )}
 
-              {/* QR Code Kartu Pelajar Saya */}
-              {currentRole === 'siswa' && (
+              {/* QR Code Kartu Pelajar (siswa: milik sendiri; ortu: milik anak yang terhubung dengan akun) */}
+              {isStudentAccount && (
                 <div className="pt-4 border-t border-slate-200 space-y-2">
-                  <div className="text-xs font-bold text-slate-900">Kartu Pelajar Digital Saya:</div>
+                  <div className="text-xs font-bold text-slate-900">{currentRole === 'ortu' ? 'Kartu Pelajar Digital Anak Saya:' : 'Kartu Pelajar Digital Saya:'}</div>
+                  {myStudentName && (
+                    <div className="text-[11px] text-slate-700">
+                      <span className="font-semibold">{myStudentName}</span>
+                      {myIdentifier ? ` • NISN ${myIdentifier}` : ''}{myClassName ? ` • ${myClassName}` : ''}
+                    </div>
+                  )}
                   <p className="text-[11px] text-slate-500">Tunjukkan QR Code ini ke petugas satpam atau kamera kiosk untuk absensi.</p>
                   <button
                     disabled={!myQrValue}
@@ -438,11 +577,11 @@ export default function AttendanceView() {
                       open: true,
                       title: 'QR Code Kartu Absensi Siswa',
                       value: myQrValue,
-                      subtitle: `${currentUser.name} - NISN ${myIdentifier}`
+                      subtitle: `${myStudentName || currentUser.name} - NISN ${myIdentifier || '-'}${myClassName ? ` • ${myClassName}` : ''}`
                     })}
                     className="w-full py-2.5 rounded-xl bg-slate-100 hover:bg-emerald-50 text-emerald-700 border border-emerald-500/30 text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    <QrCode className="w-4 h-4" /> {myQrValue ? 'Buka QR Code Kartu Saya' : 'QR kartu belum tersedia (belum ada catatan presensi)'}
+                    <QrCode className="w-4 h-4" /> {myQrValue ? (currentRole === 'ortu' ? 'Buka QR Code Kartu Anak' : 'Buka QR Code Kartu Saya') : 'QR kartu belum tersedia (akun belum terhubung dengan data siswa)'}
                   </button>
                 </div>
               )}
@@ -578,7 +717,8 @@ export default function AttendanceView() {
           {relatedStudentId && (
             <div className="bg-white border border-slate-200 rounded-3xl p-6 space-y-4">
               <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <UserRoundCheck className="w-4 h-4 text-emerald-600" /> Riwayat Presensi Saya (10 terakhir)
+                <UserRoundCheck className="w-4 h-4 text-emerald-600" /> {currentRole === 'ortu' ? 'Riwayat Presensi Anak Saya' : 'Riwayat Presensi Saya'} (10 terakhir)
+                {myStudentName && <span className="text-xs font-normal text-slate-500">• {myStudentName}</span>}
               </h3>
               {myHistory.length === 0 ? (
                 <p className="text-xs text-slate-500">Belum ada catatan presensi untuk akun ini.</p>

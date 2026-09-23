@@ -34,6 +34,9 @@ const fetchJson = async (url, options) => {
 export default function EraporView() {
   const { currentUser, currentRole, canAccess, showToast } = useAuth();
   const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  // Akun siswa/ortu: identitas rapor & studentId berasal dari currentUser.student (sesi login), tanpa fallback ID hardcoded.
+  const linkedStudent = isStudentAccount && currentUser.student ? currentUser.student : null;
+  const linkedStudentId = isStudentAccount ? (Number(linkedStudent?.id) || Number(currentUser.related_student_id) || null) : null;
   const canInputGrades = canAccess('erapor') && !isStudentAccount;
   // Daftar siswa berasal dari modul buku_induk; guru_walikelas/guru/siswa/ortu tidak memilikinya (server: 403).
   const canListStudents = canAccess('buku_induk');
@@ -43,8 +46,9 @@ export default function EraporView() {
   const [studentListNotice, setStudentListNotice] = useState('');
   const [selectedSemester, setSelectedSemester] = useState('Ganjil');
   const [selectedYear, setSelectedYear] = useState('2024/2025');
-  // Fallback: akun siswa/ortu memakai related_student_id; peran tanpa daftar siswa memakai ID 1.
-  const [selectedStudentId, setSelectedStudentId] = useState(() => Number(currentUser.related_student_id) || 1);
+  // Siswa/ortu: siswa yang terhubung dengan akun (null bila belum tertaut -> rapor tidak dimuat).
+  // Staf: dipilih dari daftar Buku Induk; peran staf tanpa daftar siswa memakai ID 1 sebagai awal.
+  const [selectedStudentId, setSelectedStudentId] = useState(() => (isStudentAccount ? linkedStudentId : 1));
   const [showAddModal, setShowAddModal] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -60,10 +64,15 @@ export default function EraporView() {
   const [manualClassName, setManualClassName] = useState('');
 
   useEffect(() => {
+    if (isStudentAccount) {
+      // Identitas mengikuti siswa yang terhubung dengan akun (ikut berubah saat login/logout tanpa remount).
+      setStudents([]);
+      setStudentListNotice('');
+      setSelectedStudentId(linkedStudentId);
+      return;
+    }
     if (!canListStudents) {
-      if (!isStudentAccount) {
-        setStudentListNotice('Daftar siswa (Buku Induk) tidak tersedia untuk peran Anda. Rapor menampilkan siswa berdasarkan ID terpilih; identitas siswa diambil dari data nilai atau diisi manual saat input nilai.');
-      }
+      setStudentListNotice('Daftar siswa (Buku Induk) tidak tersedia untuk peran Anda. Rapor menampilkan siswa berdasarkan ID terpilih; identitas siswa diambil dari data nilai atau diisi manual saat input nilai.');
       return;
     }
     fetchJson('/api/master/students')
@@ -74,9 +83,17 @@ export default function EraporView() {
         if (list.length) setSelectedStudentId(prev => (list.some(s => s.id === prev) ? prev : list[0].id));
       })
       .catch(err => setStudentListNotice(err.message || 'Daftar siswa tidak dapat dimuat.'));
-  }, [canListStudents, isStudentAccount]);
+  }, [canListStudents, isStudentAccount, linkedStudentId]);
 
   const fetchGrades = () => {
+    if (!selectedStudentId) {
+      // Tidak ada siswa yang bisa dimuat (akun siswa/ortu belum tertaut): jangan panggil API dengan ID palsu.
+      setGrades([]);
+      setGradesError(isStudentAccount
+        ? 'Akun ini belum terhubung dengan data siswa, sehingga rapor belum dapat ditampilkan. Hubungi Tata Usaha untuk menautkan akun.'
+        : 'Pilih siswa terlebih dahulu.');
+      return;
+    }
     const params = new URLSearchParams({ student_id: String(selectedStudentId), semester: selectedSemester, academic_year: selectedYear });
     fetchJson(`/api/erapor/grades?${params.toString()}`)
       .then(data => { setGrades(Array.isArray(data) ? data : []); setGradesError(''); })
@@ -87,12 +104,13 @@ export default function EraporView() {
     fetchGrades();
   }, [selectedStudentId, selectedSemester, selectedYear]);
 
-  // Identitas siswa aktif: daftar Buku Induk (bila ada) -> data nilai -> akun login -> isian manual.
+  // Identitas siswa aktif: Buku Induk (staf) -> siswa terhubung dari sesi login (siswa/ortu) -> data nilai -> akun login -> isian manual.
   const selectedStudent = students.find(s => s.id === Number(selectedStudentId)) || null;
-  const studentName = selectedStudent?.name || grades[0]?.student_name || (currentRole === 'siswa' ? currentUser.name : '') || manualStudentName || '-';
-  const studentClass = selectedStudent?.class_name || grades[0]?.class_name || manualClassName || '-';
-  const studentNisn = selectedStudent?.nisn || '-';
-  const studentNis = selectedStudent?.nis || '-';
+  const identityStudent = selectedStudent || (linkedStudent && Number(linkedStudent.id) === Number(selectedStudentId) ? linkedStudent : null);
+  const studentName = identityStudent?.name || grades[0]?.student_name || (currentRole === 'siswa' ? currentUser.name : '') || manualStudentName || '-';
+  const studentClass = identityStudent?.class_name || grades[0]?.class_name || manualClassName || '-';
+  const studentNisn = identityStudent?.nisn || '-';
+  const studentNis = identityStudent?.nis || '-';
 
   const openAddModal = () => {
     setManualStudentName(selectedStudent?.name || grades[0]?.student_name || (currentRole === 'siswa' ? currentUser.name : ''));

@@ -12,22 +12,54 @@ import {
   Cpu, 
   HeartPulse, 
   BookOpen, 
-  Sparkles 
+  Sparkles,
+  X,
+  Loader2
 } from 'lucide-react';
 
+const EMPTY_MEMBERS_MODAL = { open: false, ekskul: null, members: [], loading: false, error: '' };
+
 export default function ExtracurricularView() {
-  const { currentUser, showToast } = useAuth();
+  const { currentUser, isStaff, showToast } = useAuth();
+  // Kelas default dari data siswa terkait akun (siswa/ortu); staf mengisi manual.
+  const defaultClassName = currentUser?.student?.class_name || '';
   const [ekskulList, setEkskulList] = useState([]);
   const [joinModal, setJoinModal] = useState({ open: false, ekskul: null });
+  const [membersModal, setMembersModal] = useState(EMPTY_MEMBERS_MODAL); // staf: daftar anggota per ekskul
   const [studentName, setStudentName] = useState(currentUser?.name || '');
-  const [studentClass, setStudentClass] = useState('');
+  const [studentClass, setStudentClass] = useState(defaultClassName);
   const [reason, setReason] = useState('Ingin mengasah minat, bakat, dan disiplin diri.');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Nama pendaftar mengikuti akun yang sedang login (bukan nama demo statis) dan tetap dapat diubah.
+  // Nama & kelas pendaftar mengikuti akun yang sedang login (bukan nama demo statis) dan tetap dapat diubah.
   useEffect(() => {
     setStudentName(currentUser?.name || '');
-  }, [currentUser?.name]);
+    setStudentClass(defaultClassName);
+  }, [currentUser?.name, defaultClassName]);
+
+  const openJoinModal = (ekskul) => {
+    setStudentName(currentUser?.name || '');
+    setStudentClass(defaultClassName);
+    setJoinModal({ open: true, ekskul });
+  };
+
+  // Staf: GET /api/extracurriculars/:id/members (403 untuk non-staf → pesan server ditampilkan)
+  const openMembersModal = async (ekskul) => {
+    setMembersModal({ open: true, ekskul, members: [], loading: true, error: '' });
+    try {
+      const res = await fetch(`/api/extracurriculars/${ekskul.id}/members`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Daftar anggota belum dapat dimuat.');
+      setMembersModal((prev) => (prev.open && prev.ekskul?.id === ekskul.id
+        ? { ...prev, members: Array.isArray(data) ? data : [], loading: false, error: '' }
+        : prev));
+    } catch (error) {
+      setMembersModal((prev) => (prev.open && prev.ekskul?.id === ekskul.id
+        ? { ...prev, members: [], loading: false, error: error.message || 'Daftar anggota belum dapat dimuat.' }
+        : prev));
+      showToast(error.message || 'Daftar anggota belum dapat dimuat.', 'error');
+    }
+  };
 
   const fetchEkskuls = () => {
     fetch('/api/extracurriculars')
@@ -63,10 +95,15 @@ export default function ExtracurricularView() {
         })
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal mendaftar ekskul');
+      if (!res.ok || data.success === false) throw new Error(data.message || 'Gagal mendaftar ekskul'); // 409: sudah terdaftar
       showToast(data.message || 'Pendaftaran ekstrakurikuler berhasil', 'success');
       setJoinModal({ open: false, ekskul: null });
-      fetchEkskuls();
+      if (data.extracurricular?.id) {
+        // Perbarui jumlah anggota langsung dari data ekskul yang dikembalikan server
+        setEkskulList((prev) => prev.map((item) => (item.id === data.extracurricular.id ? { ...item, ...data.extracurricular } : item)));
+      } else {
+        fetchEkskuls();
+      }
     } catch (error) {
       showToast(error.message || 'Gagal mendaftar ekskul', 'error');
     } finally {
@@ -175,12 +212,23 @@ export default function ExtracurricularView() {
                 <Users className="w-3.5 h-3.5 text-slate-400" />
                 <span className="font-semibold text-slate-700">{Number(e.member_count) || 0} Siswa</span>
               </div>
-              <button
-                onClick={() => setJoinModal({ open: true, ekskul: e })}
-                className="px-3.5 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white text-xs font-semibold shadow-xs transition-colors"
-              >
-                Daftar Ekskul
-              </button>
+              <div className="flex items-center gap-2">
+                {isStaff && (
+                  <button
+                    onClick={() => openMembersModal(e)}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 hover:border-[#002147] hover:bg-slate-50 text-[#002147] text-xs font-semibold transition-colors inline-flex items-center gap-1.5"
+                    title="Lihat daftar anggota"
+                  >
+                    <Users className="w-3.5 h-3.5" /> Lihat anggota
+                  </button>
+                )}
+                <button
+                  onClick={() => openJoinModal(e)}
+                  className="px-3.5 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] text-white text-xs font-semibold shadow-xs transition-colors"
+                >
+                  Daftar Ekskul
+                </button>
+              </div>
             </div>
           </div>
         ))}
@@ -249,6 +297,64 @@ export default function ExtracurricularView() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DAFTAR ANGGOTA (hanya pembina/staf) */}
+      {isStaff && membersModal.open && membersModal.ekskul && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-lg w-full p-6 shadow-2xl animate-in zoom-in-95 max-h-[90vh] flex flex-col">
+            <div className="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <h3 className="text-base font-bold text-[#002147]">Anggota {membersModal.ekskul.name}</h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Pembina: {membersModal.ekskul.coach_name} • {membersModal.loading ? 'Memuat…' : `${membersModal.members.length} anggota terdaftar`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMembersModal(EMPTY_MEMBERS_MODAL)}
+                className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                title="Tutup"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto -mx-1 px-1 space-y-2 text-xs">
+              {membersModal.loading && (
+                <div className="py-10 text-center text-slate-500 flex items-center justify-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Memuat daftar anggota…
+                </div>
+              )}
+              {!membersModal.loading && membersModal.error && (
+                <div className="py-8 text-center text-rose-700 bg-rose-50 border border-rose-200 rounded-xl">
+                  {membersModal.error}
+                  <div className="mt-2">
+                    <button type="button" onClick={() => openMembersModal(membersModal.ekskul)} className="px-3 py-1 rounded-lg border border-rose-300 bg-white text-[11px] font-semibold text-rose-700 hover:bg-rose-100">Coba lagi</button>
+                  </div>
+                </div>
+              )}
+              {!membersModal.loading && !membersModal.error && membersModal.members.length === 0 && (
+                <div className="py-10 text-center text-slate-500 border border-dashed border-slate-300 rounded-xl">
+                  <Users className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                  Belum ada siswa yang mendaftar ke ekstrakurikuler ini.
+                </div>
+              )}
+              {!membersModal.loading && !membersModal.error && membersModal.members.map((member, idx) => (
+                <div key={member.id} className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-bold text-[#002147]">{idx + 1}. {member.student_name}</div>
+                    {member.class_name && (
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">{member.class_name}</span>
+                    )}
+                  </div>
+                  {member.reason && <p className="text-[11px] text-slate-600 mt-1 italic">"{member.reason}"</p>}
+                  <p className="text-[10px] text-slate-400 mt-1">Terdaftar: {member.created_at || '-'}</p>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

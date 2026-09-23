@@ -17,6 +17,14 @@ import {
 
 const DEFAULT_COUNSELOR = 'Rina Marlina, S.Psi';
 
+// Status sesi konseling (sesuai server: dijadwalkan | selesai | dibatalkan) beserta label & warna badge.
+const SESSION_STATUS = {
+  dijadwalkan: { label: 'Dijadwalkan', className: 'bg-amber-100 text-amber-800' },
+  selesai: { label: 'Selesai', className: 'bg-emerald-100 text-emerald-800' },
+  dibatalkan: { label: 'Dibatalkan', className: 'bg-rose-100 text-rose-800' },
+};
+const EMPTY_STATUS_MODAL = { open: false, session: null, status: 'selesai', notes: '' };
+
 // Tanggal lokal (bukan UTC) agar konsisten dengan tanggal "hari ini" di server.
 const toLocalDateString = (date = new Date()) => {
   const d = new Date(date);
@@ -33,8 +41,11 @@ const fetchJson = async (url, options) => {
 };
 
 export default function CounselingView() {
-  const { currentUser, currentRole, canAccess, showToast } = useAuth();
+  const { currentUser, currentRole, canAccess, isStaff, showToast } = useAuth();
   const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  // Siswa terkait akun (siswa/ortu) dari server; identitasnya dikunci agar tidak mengajukan atas nama orang lain.
+  const linkedStudent = isStudentAccount ? (currentUser.student || null) : null;
+  const lockStudentName = currentRole === 'siswa' || Boolean(linkedStudent?.name);
   // Daftar siswa dari Buku Induk hanya untuk peran yang berhak (kepala_bk/kepsek/admin); guru_walikelas mengisi manual.
   const canListStudents = canAccess('buku_induk');
   // Konselor: akun BK memakai namanya sendiri; peran lain mencatat atas nama guru BK.
@@ -45,11 +56,14 @@ export default function CounselingView() {
   const [studentsLoaded, setStudentsLoaded] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Staf: ubah status sesi (PATCH /api/counseling/sessions/:id/status)
+  const [statusModal, setStatusModal] = useState(EMPTY_STATUS_MODAL);
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
 
   // Form Booking (identitas siswa tidak lagi ditulis tetap)
-  const [studentId, setStudentId] = useState(() => String(currentUser.related_student_id || (isStudentAccount ? '' : 1)));
-  const [studentName, setStudentName] = useState(currentRole === 'siswa' ? currentUser.name : '');
-  const [className, setClassName] = useState('');
+  const [studentId, setStudentId] = useState(() => String(linkedStudent?.id || currentUser.related_student_id || (isStudentAccount ? '' : 1)));
+  const [studentName, setStudentName] = useState(linkedStudent?.name || (currentRole === 'siswa' ? currentUser.name : ''));
+  const [className, setClassName] = useState(linkedStudent?.class_name || '');
   const [category, setCategory] = useState('karir');
   const [topic, setTopic] = useState('');
   const [sessionDate, setSessionDate] = useState(() => {
@@ -130,6 +144,43 @@ export default function CounselingView() {
       showToast(err.message || 'Gagal mengajukan jadwal konseling', 'error');
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  // Staf: buka dialog ubah status sesi. Usulan status default: sesi terjadwal → selesai; lainnya → dijadwalkan ulang.
+  const openStatusModal = (session) => {
+    setStatusModal({
+      open: true,
+      session,
+      status: session.status === 'dijadwalkan' ? 'selesai' : 'dijadwalkan',
+      notes: session.notes || ''
+    });
+  };
+
+  const handleStatusSubmit = async (e) => {
+    e.preventDefault();
+    if (isUpdatingStatus || !statusModal.session) return;
+    const { session, status } = statusModal;
+    if (!SESSION_STATUS[status]) return showToast('Status sesi tidak valid.', 'error');
+    if (status === 'dibatalkan' && !window.confirm(`Batalkan sesi konseling "${session.topic}" untuk ${session.student_name}?`)) return;
+
+    setIsUpdatingStatus(true);
+    try {
+      const cleanNotes = statusModal.notes.trim();
+      const body = { status };
+      if (cleanNotes) body.notes = cleanNotes; // catatan kosong: server mempertahankan catatan lama
+      const data = await fetchJson(`/api/counseling/sessions/${session.id}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      showToast(data.message || 'Status sesi konseling diperbarui.', 'success');
+      setStatusModal(EMPTY_STATUS_MODAL);
+      fetchSessions();
+    } catch (err) {
+      showToast(err.message || 'Gagal mengubah status sesi konseling', 'error');
+    } finally {
+      setIsUpdatingStatus(false);
     }
   };
 
@@ -241,12 +292,13 @@ export default function CounselingView() {
                 <th className="py-3 px-3 text-center">Konselor</th>
                 <th className="py-3 px-3 text-center">Status</th>
                 <th className="py-3 px-4">Catatan Tindak Lanjut</th>
+                {isStaff && <th className="py-3 px-3 text-center">Aksi</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {sessions.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">{loadError || 'Belum ada sesi konseling terdaftar.'}</td>
+                  <td colSpan={isStaff ? 9 : 8} className="py-8 text-center text-slate-400 text-xs">{loadError || 'Belum ada sesi konseling terdaftar.'}</td>
                 </tr>
               )}
               {sessions.map((s, idx) => (
@@ -268,15 +320,25 @@ export default function CounselingView() {
                   </td>
                   <td className="py-3.5 px-3 text-center font-medium text-slate-700">{s.counselor_name}</td>
                   <td className="py-3.5 px-3 text-center">
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                      s.status === 'selesai' ? 'bg-emerald-100 text-emerald-800' : s.status === 'dibatalkan' ? 'bg-rose-100 text-rose-800' : 'bg-amber-100 text-amber-800'
-                    }`}>
-                      {s.status}
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${SESSION_STATUS[s.status]?.className || 'bg-slate-100 text-slate-600'}`}>
+                      {SESSION_STATUS[s.status]?.label || s.status}
                     </span>
                   </td>
                   <td className="py-3.5 px-4 text-[11px] text-slate-600 italic">
-                    {s.notes || 'Menunggu pelaksanaan sesi temu'}
+                    {s.notes || (s.status === 'dijadwalkan' ? 'Menunggu pelaksanaan sesi temu' : '-')}
                   </td>
+                  {isStaff && (
+                    <td className="py-3.5 px-3 text-center">
+                      <button
+                        type="button"
+                        onClick={() => openStatusModal(s)}
+                        disabled={isUpdatingStatus}
+                        className="px-2.5 py-1 rounded-lg border border-slate-300 hover:border-[#002147] hover:bg-slate-50 disabled:opacity-50 text-[10px] font-semibold text-[#002147] whitespace-nowrap"
+                      >
+                        Ubah Status
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -313,7 +375,7 @@ export default function CounselingView() {
                       type="text"
                       value={studentName}
                       onChange={(e) => setStudentName(e.target.value)}
-                      readOnly={currentRole === 'siswa'}
+                      readOnly={lockStudentName}
                       placeholder="Nama lengkap siswa"
                       className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 read-only:bg-slate-50"
                       required
@@ -427,6 +489,69 @@ export default function CounselingView() {
                   className="px-4 py-1.5 rounded-lg bg-[#002147] hover:bg-[#0a2f5c] disabled:opacity-50 text-white font-semibold"
                 >
                   {isSubmitting ? 'Mengirim...' : 'Ajukan Sesi'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL UBAH STATUS SESI (hanya konselor/staf) */}
+      {isStaff && statusModal.open && statusModal.session && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-md w-full p-6 shadow-2xl animate-in zoom-in-95">
+            <h3 className="text-base font-bold text-[#002147] mb-1">Ubah Status Sesi Konseling</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              {statusModal.session.student_name} ({statusModal.session.class_name}) • {statusModal.session.topic}
+              <br />
+              Jadwal: {statusModal.session.session_date} {statusModal.session.session_time} WIB • Status saat ini:{' '}
+              <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${SESSION_STATUS[statusModal.session.status]?.className || 'bg-slate-100 text-slate-600'}`}>
+                {SESSION_STATUS[statusModal.session.status]?.label || statusModal.session.status}
+              </span>
+            </p>
+            <form onSubmit={handleStatusSubmit} className="space-y-3 text-xs">
+              <div>
+                <label className="block text-slate-600 font-semibold mb-1">Status Baru</label>
+                <select
+                  value={statusModal.status}
+                  onChange={(e) => setStatusModal(prev => ({ ...prev, status: e.target.value }))}
+                  className="w-full p-2 border border-slate-300 rounded-lg text-slate-900 bg-white"
+                >
+                  {Object.entries(SESSION_STATUS).map(([value, meta]) => (
+                    <option key={value} value={value}>{meta.label}</option>
+                  ))}
+                </select>
+                {statusModal.status === 'dibatalkan' && (
+                  <p className="text-[10px] text-rose-600 mt-1">Pembatalan akan diminta konfirmasi sebelum disimpan.</p>
+                )}
+              </div>
+              <div>
+                <label className="block text-slate-600 font-semibold mb-1">Catatan Tindak Lanjut (Opsional)</label>
+                <textarea
+                  value={statusModal.notes}
+                  onChange={(e) => setStatusModal(prev => ({ ...prev, notes: e.target.value }))}
+                  placeholder="Ringkasan hasil sesi, rekomendasi, atau alasan pembatalan..."
+                  rows="3"
+                  className="w-full p-2 border border-slate-300 rounded-lg text-slate-900"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setStatusModal(EMPTY_STATUS_MODAL)}
+                  disabled={isUpdatingStatus}
+                  className="px-3.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 font-semibold"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUpdatingStatus}
+                  className={`px-4 py-1.5 rounded-lg disabled:opacity-50 text-white font-semibold ${
+                    statusModal.status === 'dibatalkan' ? 'bg-rose-600 hover:bg-rose-700' : 'bg-[#002147] hover:bg-[#0a2f5c]'
+                  }`}
+                >
+                  {isUpdatingStatus ? 'Menyimpan...' : 'Simpan Status'}
                 </button>
               </div>
             </form>

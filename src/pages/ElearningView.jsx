@@ -61,7 +61,8 @@ export default function ElearningView() {
   const canManage = isStaff;
   const userRoleLabel = ROLE_LABELS[currentRole] || currentUser?.badge || currentUser?.title || 'Warga Sekolah';
   const getStudentId = () => {
-    const raw = currentUser?.related_student_id ?? currentUser?.id ?? 1;
+    // Akun siswa/ortu membawa data siswa terkait (currentUser.student); server tetap memakai identitas sesi.
+    const raw = currentUser?.student?.id ?? currentUser?.related_student_id ?? currentUser?.id ?? 1;
     const parsed = Number(raw);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
   };
@@ -84,8 +85,11 @@ export default function ElearningView() {
   const [isSendingChat, setIsSendingChat] = useState(false);
   const [submissionTexts, setSubmissionTexts] = useState({}); // teks jawaban per tugas (task id -> teks)
   const [submittingTaskId, setSubmittingTaskId] = useState(null);
-  const [submittedTasks, setSubmittedTasks] = useState({});
+  const [mySubmissions, setMySubmissions] = useState({}); // siswa: jawaban sendiri per tugas (task id -> submission | null)
   const [taskSubmissions, setTaskSubmissions] = useState({}); // daftar submisi per tugas (untuk guru)
+  const [gradingSubmissionId, setGradingSubmissionId] = useState(null); // guru: id submisi yang sedang dinilai
+  const [gradeForm, setGradeForm] = useState({ score: '', feedback: '' });
+  const [savingGradeId, setSavingGradeId] = useState(null);
   const [expandedSubmissions, setExpandedSubmissions] = useState({});
   const [loadingSubmissionsId, setLoadingSubmissionsId] = useState(null);
   const selectedModuleIdRef = useRef(null); // id modul aktif untuk mengabaikan respons usang
@@ -202,6 +206,48 @@ export default function ElearningView() {
     if (willExpand) await loadSubmissions(taskId);
   };
 
+  // Guru/staf: buka formulir penilaian untuk satu jawaban siswa
+  const openGradeForm = (submission) => {
+    const hasScore = submission.score !== null && submission.score !== undefined;
+    setGradingSubmissionId(submission.id);
+    setGradeForm({
+      score: hasScore ? String(submission.score) : '',
+      feedback: hasScore && submission.feedback ? submission.feedback : ''
+    });
+  };
+
+  const closeGradeForm = () => {
+    setGradingSubmissionId(null);
+    setGradeForm({ score: '', feedback: '' });
+  };
+
+  // Guru/staf: simpan nilai & umpan balik → PUT /api/elearning/submissions/:id {score, feedback}
+  const handleSaveGrade = async (task, submission) => {
+    if (savingGradeId) return;
+    const maxScore = Number(task.max_score) || 100;
+    const scoreValue = Number(gradeForm.score);
+    if (String(gradeForm.score).trim() === '' || !Number.isFinite(scoreValue) || scoreValue < 0 || scoreValue > maxScore) {
+      return showToast(`Nilai harus berupa angka 0 - ${maxScore}.`, 'error');
+    }
+
+    setSavingGradeId(submission.id);
+    try {
+      const res = await fetch(`/api/elearning/submissions/${submission.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ score: scoreValue, feedback: gradeForm.feedback.trim() })
+      });
+      const data = await parseResponse(res, 'Gagal menyimpan nilai tugas');
+      showToast(data.message || 'Nilai tugas berhasil disimpan.', 'success');
+      closeGradeForm();
+      await loadSubmissions(task.id);
+    } catch (err) {
+      showToast(err.message || 'Gagal menyimpan nilai tugas', 'error');
+    } finally {
+      setSavingGradeId(null);
+    }
+  };
+
   const selectModule = (mod) => {
     if (!mod) return;
     selectedModuleIdRef.current = mod.id;
@@ -210,26 +256,32 @@ export default function ElearningView() {
     setTasks([]);
     setDiscussions([]);
     setExpandedSubmissions({});
+    setMySubmissions({});
+    setGradingSubmissionId(null);
     loadTasks(mod.id);
     loadDiscussions(mod.id, { silent: true });
   };
 
-  // Siswa: tandai tugas yang sudah pernah dikumpulkan (berdasarkan submisi tersimpan di server)
+  // Siswa: ambil jawaban sendiri untuk sebuah tugas. Server hanya mengembalikan submisi milik akun ini.
+  // Mengembalikan objek submisi, null bila belum mengumpulkan, atau undefined bila gagal dimuat.
+  const loadMySubmission = async (taskId) => {
+    const res = await fetch(`/api/elearning/submissions/${taskId}`).catch(() => null);
+    if (!res || !res.ok) return undefined;
+    const data = await res.json().catch(() => null);
+    if (!Array.isArray(data)) return undefined;
+    const studentId = getStudentId();
+    return data.find((s) => Number(s.student_id) === studentId) || data[0] || null;
+  };
+
+  // Siswa: muat status jawaban (belum dikumpulkan / menunggu penilaian / sudah dinilai) untuk setiap tugas
   useEffect(() => {
     if (canManage || tasks.length === 0) return undefined;
     let cancelled = false;
-    const studentId = getStudentId();
-    Promise.all(tasks.map(async (t) => {
-      const res = await fetch(`/api/elearning/submissions/${t.id}`).catch(() => null);
-      if (!res || !res.ok) return null;
-      const data = await res.json().catch(() => null);
-      if (!Array.isArray(data)) return null;
-      return data.some((s) => Number(s.student_id) === studentId) ? t.id : null;
-    })).then((ids) => {
+    Promise.all(tasks.map(async (t) => [t.id, await loadMySubmission(t.id)])).then((entries) => {
       if (cancelled) return;
-      setSubmittedTasks((prev) => {
+      setMySubmissions((prev) => {
         const next = { ...prev };
-        ids.forEach((id) => { if (id) next[id] = true; });
+        entries.forEach(([id, sub]) => { if (sub !== undefined) next[id] = sub; });
         return next;
       });
     });
@@ -284,10 +336,23 @@ export default function ElearningView() {
           submission_text: text
         })
       });
-      const data = await parseResponse(res, 'Gagal mengumpulkan tugas');
-      showToast(data.message || 'Jawaban tugas berhasil dikumpulkan!', 'success');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        // 409: jawaban sudah dinilai guru → segarkan status agar nilai tampil dan kotak kirim ulang ditutup
+        if (res.status === 409) {
+          const latest = await loadMySubmission(taskId);
+          if (latest !== undefined) setMySubmissions(prev => ({ ...prev, [taskId]: latest }));
+        }
+        throw new Error(data.message || 'Gagal mengumpulkan tugas');
+      }
+      showToast(data.message || (data.updated ? 'Jawaban tugas berhasil diperbarui!' : 'Jawaban tugas berhasil dikumpulkan!'), 'success');
       setSubmissionTexts(prev => ({ ...prev, [taskId]: '' }));
-      setSubmittedTasks(prev => ({ ...prev, [taskId]: true }));
+      if (data.submission) {
+        setMySubmissions(prev => ({ ...prev, [taskId]: data.submission }));
+      } else {
+        const latest = await loadMySubmission(taskId);
+        if (latest !== undefined) setMySubmissions(prev => ({ ...prev, [taskId]: latest }));
+      }
     } catch (err) {
       showToast(err.message || 'Terjadi kesalahan saat mengumpulkan tugas', 'error');
     } finally {
@@ -795,7 +860,13 @@ export default function ElearningView() {
                   </div>
 
                   {/* List Tugas */}
-                  {tasks.map((t) => (
+                  {tasks.map((t) => {
+                    const maxScore = Number(t.max_score) || 100;
+                    const submissionList = taskSubmissions[t.id] || [];
+                    const ungradedCount = submissionList.filter((s) => s.score === null || s.score === undefined).length;
+                    const mySubmission = mySubmissions[t.id]; // undefined: belum dimuat, null: belum dikumpulkan
+                    const isMyGraded = Boolean(mySubmission) && mySubmission.score !== null && mySubmission.score !== undefined;
+                    return (
                     <div key={t.id} className="bg-white border-2 border-slate-200 rounded-3xl p-6 sm:p-8 space-y-4 shadow-sm">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
@@ -832,23 +903,105 @@ export default function ElearningView() {
                           >
                             {loadingSubmissionsId === t.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileText className="w-4 h-4 text-emerald-700" />}
                             {expandedSubmissions[t.id] ? 'Tutup Daftar Submisi' : 'Lihat Submisi Siswa'}
-                            {taskSubmissions[t.id] && ` (${taskSubmissions[t.id].length})`}
+                            {taskSubmissions[t.id] && ` (${submissionList.length}${ungradedCount ? `, ${ungradedCount} belum dinilai` : ''})`}
                           </button>
 
                           {expandedSubmissions[t.id] && (
                             <div className="space-y-2">
-                              {(taskSubmissions[t.id] || []).map((s) => (
-                                <div key={s.id} className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-xs space-y-1">
-                                  <div className="flex items-center justify-between gap-2">
-                                    <span className="font-black text-black">{s.student_name}</span>
-                                    <span className="text-[10px] font-bold text-slate-500">{s.submitted_at}</span>
+                              {submissionList.map((s) => {
+                                const isGraded = s.score !== null && s.score !== undefined;
+                                const isEditing = gradingSubmissionId === s.id;
+                                const isSaving = savingGradeId === s.id;
+                                return (
+                                  <div key={s.id} className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-xs space-y-2">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="font-black text-black">{s.student_name}</span>
+                                        {isGraded ? (
+                                          <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-900 border border-emerald-300 inline-flex items-center gap-1">
+                                            <CheckCircle className="w-3 h-3" /> Nilai: {s.score}/{maxScore}
+                                          </span>
+                                        ) : (
+                                          <span className="px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-900 border border-amber-300 inline-flex items-center gap-1">
+                                            <Clock className="w-3 h-3" /> Belum dinilai
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-[10px] font-bold text-slate-500">{s.submitted_at}</span>
+                                        {!isEditing && (
+                                          <button
+                                            type="button"
+                                            onClick={() => openGradeForm(s)}
+                                            disabled={savingGradeId !== null}
+                                            className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-[10px] font-black inline-flex items-center gap-1"
+                                          >
+                                            <Award className="w-3 h-3" /> {isGraded ? 'Ubah Nilai' : 'Nilai'}
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <p className="text-slate-800 whitespace-pre-line">{s.submission_text || '-'}</p>
+                                    {isGraded && !isEditing && (
+                                      <div className="text-[11px] font-bold text-emerald-800">
+                                        Umpan balik: {s.feedback || '-'}
+                                      </div>
+                                    )}
+
+                                    {/* Formulir penilaian guru (nilai 0..max_score + umpan balik) */}
+                                    {isEditing && (
+                                      <div className="pt-2 border-t border-slate-200 space-y-2">
+                                        <div className="grid grid-cols-1 sm:grid-cols-[130px_1fr] gap-2">
+                                          <div>
+                                            <label className="block text-[10px] font-black text-black uppercase tracking-wider mb-1">
+                                              Nilai (0 - {maxScore})
+                                            </label>
+                                            <input
+                                              type="number"
+                                              min="0"
+                                              max={maxScore}
+                                              value={gradeForm.score}
+                                              onChange={(e) => setGradeForm(prev => ({ ...prev, score: e.target.value }))}
+                                              className="w-full bg-white border-2 border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-black focus:outline-none focus:border-black"
+                                            />
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] font-black text-black uppercase tracking-wider mb-1">
+                                              Umpan Balik (opsional)
+                                            </label>
+                                            <input
+                                              type="text"
+                                              value={gradeForm.feedback}
+                                              onChange={(e) => setGradeForm(prev => ({ ...prev, feedback: e.target.value }))}
+                                              placeholder="Catatan singkat untuk siswa..."
+                                              className="w-full bg-white border-2 border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-black placeholder:text-slate-400 focus:outline-none focus:border-black"
+                                            />
+                                          </div>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => handleSaveGrade(t, s)}
+                                            disabled={isSaving}
+                                            className="px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-[11px] font-black inline-flex items-center gap-1.5"
+                                          >
+                                            {isSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+                                            {isSaving ? 'Menyimpan...' : 'Simpan Nilai'}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={closeGradeForm}
+                                            disabled={isSaving}
+                                            className="px-3.5 py-2 rounded-xl bg-slate-200 hover:bg-slate-300 disabled:opacity-50 text-black text-[11px] font-black"
+                                          >
+                                            Batal
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
                                   </div>
-                                  <p className="text-slate-800 whitespace-pre-line">{s.submission_text || '-'}</p>
-                                  <div className="text-[11px] font-bold text-emerald-800">
-                                    Nilai: {s.score ?? '-'}{s.feedback ? ` | ${s.feedback}` : ''}
-                                  </div>
-                                </div>
-                              ))}
+                                );
+                              })}
                               {taskSubmissions[t.id] && taskSubmissions[t.id].length === 0 && (
                                 <p className="text-xs text-slate-500">Belum ada siswa yang mengumpulkan tugas ini.</p>
                               )}
@@ -856,46 +1009,76 @@ export default function ElearningView() {
                           )}
                         </div>
                       ) : (
-                        /* Siswa: kotak pengumpulan tugas (teks jawaban disimpan per tugas) */
+                        /* Siswa: status jawaban + kotak pengumpulan tugas (teks jawaban disimpan per tugas) */
                         <div className="pt-4 border-t-2 border-slate-100 space-y-3">
-                          <div className="flex items-center justify-between">
-                            <label className="block text-xs font-black text-black uppercase tracking-wider">
-                              Ketik Jawaban Tugas / Submission:
-                            </label>
-                            {submittedTasks[t.id] && (
-                              <span className="text-xs font-black text-emerald-800 bg-emerald-100 px-2.5 py-0.5 rounded-full flex items-center gap-1">
-                                <CheckCircle className="w-3.5 h-3.5" /> Sudah Terkumpul
-                              </span>
-                            )}
-                          </div>
+                          {/* Status jawaban siswa: menunggu penilaian / sudah dinilai / belum dikumpulkan */}
+                          {mySubmission ? (
+                            <div className={`p-4 rounded-2xl border-2 space-y-1.5 ${isMyGraded ? 'bg-emerald-50 border-emerald-300' : 'bg-amber-50 border-amber-300'}`}>
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                {isMyGraded ? (
+                                  <span className="text-xs font-black text-emerald-900 inline-flex items-center gap-1.5">
+                                    <Award className="w-4 h-4 text-emerald-700" /> Nilai: {mySubmission.score} / {maxScore}
+                                  </span>
+                                ) : (
+                                  <span className="text-xs font-black text-amber-900 inline-flex items-center gap-1.5">
+                                    <Clock className="w-4 h-4 text-amber-700" /> Menunggu penilaian guru
+                                  </span>
+                                )}
+                                <span className="text-[10px] font-bold text-slate-500">Dikumpulkan: {mySubmission.submitted_at}</span>
+                              </div>
+                              {isMyGraded && (
+                                <p className="text-xs text-emerald-950 font-medium">Umpan balik guru: {mySubmission.feedback || '-'}</p>
+                              )}
+                              <p className="text-xs text-slate-700 whitespace-pre-line border-t border-black/5 pt-1.5">
+                                <span className="font-black">Jawaban Anda:</span> {mySubmission.submission_text || '-'}
+                              </p>
+                            </div>
+                          ) : mySubmission === null ? (
+                            <span className="inline-flex text-xs font-black text-slate-700 bg-slate-100 border border-slate-300 px-2.5 py-0.5 rounded-full items-center gap-1">
+                              <AlertCircle className="w-3.5 h-3.5" /> Belum dikumpulkan
+                            </span>
+                          ) : null}
 
-                          <textarea
-                            rows={4}
-                            value={submissionTexts[t.id] || ''}
-                            onChange={(e) => setSubmissionTexts(prev => ({ ...prev, [t.id]: e.target.value }))}
-                            placeholder="Tuliskan jawaban, hasil analisis, tautan berkas tugas, atau resume pembelajaran Anda di sini..."
-                            className="w-full bg-white border-2 border-slate-300 rounded-2xl p-4 text-xs sm:text-sm font-medium text-black placeholder:text-slate-500 focus:outline-none focus:border-black focus:ring-1 focus:ring-black transition-all"
-                          />
+                          {isMyGraded ? (
+                            <p className="text-xs font-bold text-slate-600 inline-flex items-center gap-1.5">
+                              <CheckCircle className="w-4 h-4 text-emerald-700" /> Tugas ini sudah dinilai guru dan tidak dapat dikirim ulang.
+                            </p>
+                          ) : (
+                            <>
+                              <label className="block text-xs font-black text-black uppercase tracking-wider">
+                                {mySubmission ? 'Perbarui Jawaban (selama belum dinilai):' : 'Ketik Jawaban Tugas / Submission:'}
+                              </label>
 
-                          <button
-                            onClick={() => handleSubmitTask(t.id)}
-                            disabled={submittingTaskId !== null || !(submissionTexts[t.id] || '').trim()}
-                            className="px-6 py-3 rounded-2xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-black text-xs sm:text-sm shadow-lg shadow-emerald-700/25 flex items-center gap-2 transition-all"
-                          >
-                            {submittingTaskId === t.id ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" /> Mengirimkan Tugas...
-                              </>
-                            ) : (
-                              <>
-                                <Upload className="w-4 h-4" /> {submittedTasks[t.id] ? 'Kirim Revisi Jawaban' : 'Kumpulkan Tugas Sekarang'}
-                              </>
-                            )}
-                          </button>
+                              <textarea
+                                rows={4}
+                                value={submissionTexts[t.id] || ''}
+                                onChange={(e) => setSubmissionTexts(prev => ({ ...prev, [t.id]: e.target.value }))}
+                                placeholder="Tuliskan jawaban, hasil analisis, tautan berkas tugas, atau resume pembelajaran Anda di sini..."
+                                className="w-full bg-white border-2 border-slate-300 rounded-2xl p-4 text-xs sm:text-sm font-medium text-black placeholder:text-slate-500 focus:outline-none focus:border-black focus:ring-1 focus:ring-black transition-all"
+                              />
+
+                              <button
+                                onClick={() => handleSubmitTask(t.id)}
+                                disabled={submittingTaskId !== null || !(submissionTexts[t.id] || '').trim()}
+                                className="px-6 py-3 rounded-2xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-black text-xs sm:text-sm shadow-lg shadow-emerald-700/25 flex items-center gap-2 transition-all"
+                              >
+                                {submittingTaskId === t.id ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 animate-spin" /> Mengirimkan Tugas...
+                                  </>
+                                ) : (
+                                  <>
+                                    <Upload className="w-4 h-4" /> {mySubmission ? 'Kirim Revisi Jawaban' : 'Kumpulkan Tugas Sekarang'}
+                                  </>
+                                )}
+                              </button>
+                            </>
+                          )}
                         </div>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
 
                   {tasks.length === 0 && (
                     <div className="bg-white border-2 border-dashed border-slate-300 rounded-3xl p-10 text-center space-y-3">

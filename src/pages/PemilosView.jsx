@@ -84,6 +84,8 @@ const PRESET_PHOTOS = [
 
 const ALLOWED_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024; // batas /api/upload di server
+// Foto bawaan paslon (sama dengan yang dipakai server saat photo_url kosong); juga placeholder & fallback gambar rusak.
+const DEFAULT_PHOTO = '/pemilos/default.svg';
 
 export default function PemilosView() {
   const { currentUser, showToast, isAuthenticated, openLogin } = useAuth();
@@ -154,7 +156,9 @@ export default function PemilosView() {
     pair_names: '',
     vision: '',
     mission: '',
-    photo_url: ''
+    photo_url: '',
+    original_photo_url: '', // foto semula, pembanding agar photo_url hanya dikirim bila berubah
+    reset_photo: false      // true = pengguna menekan "Hapus foto (pakai bawaan)" -> kirim photo_url ''
   });
 
   // Photo upload state
@@ -410,7 +414,7 @@ export default function PemilosView() {
 
     const applyPhoto = (url) => {
       if (target === 'edit') {
-        setEditCand(prev => ({ ...prev, photo_url: url }));
+        setEditCand(prev => ({ ...prev, photo_url: url, reset_photo: false }));
       } else {
         setNewCand(prev => ({ ...prev, photo_url: url }));
       }
@@ -493,7 +497,9 @@ export default function PemilosView() {
       pair_names: cand.pair_names || '',
       vision: cand.vision || '',
       mission: cand.mission || '',
-      photo_url: cand.photo_url || ''
+      photo_url: cand.photo_url || '',
+      original_photo_url: cand.photo_url || '',
+      reset_photo: false
     });
     setShowEditCandModal(true);
   };
@@ -510,13 +516,19 @@ export default function PemilosView() {
       return showToast(`Nomor urut ${candNum} sudah dipakai paslon lain`, 'error');
     }
 
+    // Kontrak PUT: photo_url tidak dikirim = foto tetap; '' = kembali ke foto bawaan; URL = ganti foto.
     const payload = {
       candidate_number: candNum,
       pair_names: pairNames,
       vision: (editCand.vision || '').trim(),
-      mission: (editCand.mission || '').trim(),
-      photo_url: (editCand.photo_url || '').trim()
+      mission: (editCand.mission || '').trim()
     };
+    const nextPhoto = (editCand.photo_url || '').trim();
+    if (editCand.reset_photo) {
+      payload.photo_url = '';
+    } else if (nextPhoto && nextPhoto !== (editCand.original_photo_url || '')) {
+      payload.photo_url = nextPhoto;
+    }
 
     setIsSavingCand(true);
     try {
@@ -603,6 +615,10 @@ export default function PemilosView() {
 
   // Daftar kelas untuk filter DPT (dari seluruh DPT, bukan hasil filter)
   const uniqueClasses = Array.from(new Set(allVoters.map(v => v.class_name).filter(Boolean))).sort();
+
+  // Status foto pada form edit: dianggap berubah bila URL berbeda dari foto semula (dan bukan permintaan reset).
+  const editPhotoTrimmed = (editCand.photo_url || '').trim();
+  const editPhotoChanged = !editCand.reset_photo && editPhotoTrimmed !== '' && editPhotoTrimmed !== (editCand.original_photo_url || '');
 
   return (
     <div className="space-y-6 pb-16">
@@ -911,12 +927,12 @@ export default function PemilosView() {
                       title="Klik untuk mengubah foto paslon ini"
                     >
                       <img
-                        src={cand.photo_url || '/pemilos/default.jpg'}
+                        src={cand.photo_url || DEFAULT_PHOTO}
                         alt={cand.pair_names}
                         className="max-h-[200px] w-auto object-contain rounded-2xl border border-slate-200 shadow-inner transition-transform group-hover/photo:scale-105"
                         onError={(e) => {
-                          e.target.onerror = null; // cegah loop bila gambar cadangan juga gagal
-                          e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=300';
+                          e.target.onerror = null; // cegah loop bila gambar bawaan juga gagal
+                          e.target.src = DEFAULT_PHOTO;
                         }}
                       />
                       {/* Overlay Edit Button */}
@@ -1324,12 +1340,12 @@ export default function PemilosView() {
                 <div key={c.id} className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 flex items-center justify-between gap-3 hover:border-slate-400 transition-colors">
                   <div className="flex items-center gap-3">
                     <img
-                      src={c.photo_url || '/pemilos/default.jpg'}
+                      src={c.photo_url || DEFAULT_PHOTO}
                       alt={c.pair_names}
                       className="w-14 h-14 rounded-2xl object-cover border border-slate-300 bg-white shadow-sm"
                       onError={(e) => {
                         e.target.onerror = null;
-                        e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
+                        e.target.src = DEFAULT_PHOTO;
                       }}
                     />
                     <div>
@@ -1415,7 +1431,7 @@ export default function PemilosView() {
                   Unggah / Pilih Foto Baru
                 </div>
                 <p className="pl-8 text-slate-700 font-medium leading-relaxed">
-                  Klik tombol <strong>"Pilih Foto dari Komputer"</strong> untuk mengunggah foto langsung dari laptop/HP Anda, atau klik salah satu pilihan <strong>Poster Bawaan</strong> di bawahnya. Foto langsung tampil di kotak pratinjau!
+                  Klik tombol <strong>"Pilih Foto dari Komputer"</strong> untuk mengunggah foto langsung dari laptop/HP Anda, atau klik salah satu pilihan <strong>Poster Bawaan</strong> di bawahnya. Foto langsung tampil di kotak pratinjau! Tombol <strong>"Hapus foto (pakai bawaan)"</strong> mengembalikan foto ke gambar bawaan sekolah.
                 </p>
               </div>
 
@@ -1505,19 +1521,15 @@ export default function PemilosView() {
                 {/* Preview Foto */}
                 <div className="flex items-center gap-4">
                   <div className="w-24 h-28 rounded-2xl border-2 border-slate-300 bg-white overflow-hidden shrink-0 flex items-center justify-center shadow-inner">
-                    {editCand.photo_url ? (
-                      <img
-                        src={editCand.photo_url}
-                        alt="Preview"
-                        className="w-full h-full object-contain"
-                        onError={(e) => {
-                          e.target.onerror = null;
-                          e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
-                        }}
-                      />
-                    ) : (
-                      <span className="text-[10px] text-slate-400 font-bold text-center px-1">Tanpa Foto</span>
-                    )}
+                    <img
+                      src={editCand.photo_url || DEFAULT_PHOTO}
+                      alt="Preview"
+                      className="w-full h-full object-contain"
+                      onError={(e) => {
+                        e.target.onerror = null;
+                        e.target.src = DEFAULT_PHOTO;
+                      }}
+                    />
                   </div>
 
                   <div className="space-y-2 flex-1">
@@ -1536,7 +1548,23 @@ export default function PemilosView() {
                     >
                       <Upload className="w-4 h-4" /> Pilih Foto dari Komputer
                     </button>
+                    <button
+                      type="button"
+                      disabled={isUploadingPhoto || editCand.reset_photo}
+                      onClick={() => setEditCand({ ...editCand, photo_url: DEFAULT_PHOTO, reset_photo: true })}
+                      className="w-full py-2 px-3 rounded-xl bg-white hover:bg-rose-50 text-rose-800 border border-rose-300 font-black text-xs flex items-center justify-center gap-2 disabled:opacity-50"
+                      title="Kembalikan foto paslon ke gambar bawaan sekolah"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Hapus foto (pakai bawaan)
+                    </button>
                     <p className="text-[10px] text-slate-500 font-medium">Bisa pilih foto file PNG, JPG, JPEG, atau WEBP</p>
+                    <p className={`text-[10px] font-bold ${editCand.reset_photo ? 'text-rose-700' : editPhotoChanged ? 'text-emerald-700' : 'text-slate-500'}`}>
+                      {editCand.reset_photo
+                        ? 'Foto akan dikembalikan ke gambar bawaan saat disimpan.'
+                        : editPhotoChanged
+                          ? 'Foto baru akan disimpan bersama perubahan lain.'
+                          : 'Foto tidak diubah (tetap memakai foto saat ini).'}
+                    </p>
                   </div>
                 </div>
 
@@ -1550,7 +1578,7 @@ export default function PemilosView() {
                       <button
                         key={idx}
                         type="button"
-                        onClick={() => setEditCand({ ...editCand, photo_url: preset.url })}
+                        onClick={() => setEditCand({ ...editCand, photo_url: preset.url, reset_photo: false })}
                         className={`text-left px-2.5 py-1.5 rounded-lg text-[11px] font-bold truncate border transition-all flex items-center justify-between ${
                           editCand.photo_url === preset.url
                             ? 'bg-amber-100 border-amber-400 text-amber-950 font-black'
@@ -1571,7 +1599,7 @@ export default function PemilosView() {
                     type="text"
                     placeholder="/pemilos/... atau https://..."
                     value={editCand.photo_url}
-                    onChange={(e) => setEditCand({ ...editCand, photo_url: e.target.value })}
+                    onChange={(e) => setEditCand({ ...editCand, photo_url: e.target.value, reset_photo: false })}
                     className="w-full p-2 bg-white border border-slate-300 rounded-xl font-mono text-[11px] text-black"
                   />
                 </div>
@@ -1685,19 +1713,15 @@ export default function PemilosView() {
                 {/* Preview Foto */}
                 <div className="flex items-center gap-4">
                   <div className="w-24 h-28 rounded-2xl border-2 border-slate-300 bg-white overflow-hidden shrink-0 flex items-center justify-center shadow-inner">
-                    {newCand.photo_url ? (
-                      <img
-                        src={newCand.photo_url}
-                        alt="Preview"
-                        className="w-full h-full object-contain"
-                        onError={(e) => {
-                          e.target.onerror = null;
-                          e.target.src = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=100';
-                        }}
-                      />
-                    ) : (
-                      <span className="text-[10px] text-slate-400 font-bold text-center px-1">Tanpa Foto</span>
-                    )}
+                    <img
+                      src={newCand.photo_url || DEFAULT_PHOTO}
+                      alt="Preview"
+                      className="w-full h-full object-contain"
+                      onError={(e) => {
+                        e.target.onerror = null;
+                        e.target.src = DEFAULT_PHOTO;
+                      }}
+                    />
                   </div>
 
                   <div className="space-y-2 flex-1">

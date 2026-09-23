@@ -20,6 +20,7 @@ seedDatabase({ verbose: false });
 // HELPER UMUM (tanggal lokal, validasi, error DB, profil sesi)
 // ==========================================
 const LATE_CUTOFF = '07:15:00';
+const DEFAULT_CANDIDATE_PHOTO = '/pemilos/default.svg';
 const pad2 = (value) => String(value).padStart(2, '0');
 // Tanggal & jam memakai zona waktu lokal server (bukan UTC) agar presensi
 // pagi hari tidak tercatat pada tanggal sebelumnya.
@@ -1995,8 +1996,11 @@ app.patch('/api/counseling/sessions/:id/status', (req, res) => {
   if (!isStaffRole(req.auth.role)) return res.status(403).json({ success: false, message: 'Hanya konselor/staf yang dapat mengubah status sesi.' });
   const status = cleanText(req.body?.status, 20);
   if (!['dijadwalkan', 'selesai', 'dibatalkan'].includes(status)) return res.status(400).json({ success: false, message: 'Status sesi tidak valid.' });
-  const notes = cleanText(req.body?.notes, 2000) || null;
-  const result = db.prepare('UPDATE counseling_sessions SET status = ?, notes = COALESCE(?, notes) WHERE id = ?').run(status, notes, req.params.id);
+  // notes tidak dikirim = tetap; dikirim (termasuk string kosong) = diganti.
+  const hasNotes = req.body?.notes !== undefined && req.body?.notes !== null;
+  const result = hasNotes
+    ? db.prepare('UPDATE counseling_sessions SET status = ?, notes = ? WHERE id = ?').run(status, cleanText(req.body.notes, 2000), req.params.id)
+    : db.prepare('UPDATE counseling_sessions SET status = ? WHERE id = ?').run(status, req.params.id);
   if (!result.changes) return res.status(404).json({ success: false, message: 'Sesi konseling tidak ditemukan.' });
   res.json({ success: true, status, message: 'Status sesi konseling diperbarui.' });
 });
@@ -2674,7 +2678,10 @@ app.get('/api/pemilos/candidates', (req, res) => {
 
 app.post('/api/pemilos/candidates', (req, res) => {
   try {
-    const { candidate_number, pair_names, vision, mission, photo_url } = req.body;
+    const { candidate_number, photo_url } = req.body || {};
+    const pair_names = cleanText(req.body?.pair_names, 150);
+    const vision = cleanText(req.body?.vision, 3000);
+    const mission = cleanText(req.body?.mission, 5000);
     if (!pair_names || !vision || !mission) {
       return res.status(400).json({ success: false, message: 'Nama paslon, visi, dan misi wajib diisi!' });
     }
@@ -2690,7 +2697,7 @@ app.post('/api/pemilos/candidates', (req, res) => {
       INSERT INTO pemilos_candidates (candidate_number, pair_names, vision, mission, photo_url, vote_count, created_at)
       VALUES (?, ?, ?, ?, ?, 0, ?)
     `);
-    const result = stmt.run(candNum, pair_names.trim(), vision.trim(), mission.trim(), photo_url || '/pemilos/default.jpg', now);
+    const result = stmt.run(candNum, pair_names, vision, mission, cleanText(photo_url, 1000) || DEFAULT_CANDIDATE_PHOTO, now);
     const newCand = db.prepare('SELECT * FROM pemilos_candidates WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ success: true, candidate: newCand, message: `Paslon No. ${candNum} (${pair_names}) berhasil didaftarkan!` });
   } catch (err) {
@@ -2705,12 +2712,14 @@ app.put('/api/pemilos/candidates/:id', (req, res) => {
       return res.status(404).json({ success: false, message: 'Pasangan calon tidak ditemukan' });
     }
 
-    const { candidate_number, pair_names, vision, mission, photo_url } = req.body;
+    const { candidate_number, pair_names, vision, mission, photo_url } = req.body || {};
     const finalNumber = (candidate_number !== undefined && candidate_number !== null && candidate_number !== '') ? Number(candidate_number) : cand.candidate_number;
-    const finalNames = (pair_names !== undefined && pair_names !== null && pair_names.trim() !== '') ? pair_names.trim() : cand.pair_names;
-    const finalVision = (vision !== undefined && vision !== null) ? vision.trim() : cand.vision;
-    const finalMission = (mission !== undefined && mission !== null) ? mission.trim() : cand.mission;
-    const finalPhoto = (photo_url !== undefined && photo_url !== null && photo_url !== '') ? photo_url : cand.photo_url;
+    const finalNames = cleanText(pair_names, 150) || cand.pair_names;
+    const finalVision = (vision !== undefined && vision !== null) ? (cleanText(vision, 3000) || cand.vision) : cand.vision;
+    const finalMission = (mission !== undefined && mission !== null) ? (cleanText(mission, 5000) || cand.mission) : cand.mission;
+    // photo_url: undefined/null = tetap; '' = kembalikan ke foto bawaan; URL = ganti foto.
+    const finalPhoto = (photo_url === undefined || photo_url === null) ? cand.photo_url : (cleanText(photo_url, 1000) || DEFAULT_CANDIDATE_PHOTO);
+    if (!Number.isInteger(finalNumber) || finalNumber < 1) return res.status(400).json({ success: false, message: 'Nomor urut paslon harus bilangan bulat positif.' });
 
     db.prepare(`
       UPDATE pemilos_candidates 
@@ -3067,7 +3076,8 @@ app.get('/api/walikelas/officers', (req, res) => {
 
 app.post('/api/walikelas/officers', (req, res) => {
   try {
-    const { position_title, student_id, student_name, phone, tasks, avatar } = req.body;
+    const { position_title, student_id, student_name, phone, tasks, avatar } = req.body || {};
+    if (!cleanText(position_title, 80) || !cleanText(student_name, 120)) return res.status(400).json({ success: false, message: 'Jabatan dan nama pengurus wajib diisi.' });
     const stmt = db.prepare(`
       INSERT INTO walikelas_officers (position_title, student_id, student_name, phone, tasks, avatar)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -3082,13 +3092,22 @@ app.post('/api/walikelas/officers', (req, res) => {
 
 app.put('/api/walikelas/officers/:id', (req, res) => {
   try {
-    const { position_title, student_name, phone, tasks, avatar } = req.body;
+    const existing = db.prepare('SELECT * FROM walikelas_officers WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Pengurus kelas tidak ditemukan.' });
+    const body = req.body || {};
+    // Pembaruan parsial; student_id ikut disimpan agar penggantian siswa saat edit tidak hilang.
+    const pick = (key, max = 300) => (body[key] === undefined ? existing[key] : (cleanText(body[key], max) || null));
+    const positionTitle = cleanText(body.position_title ?? existing.position_title, 80);
+    const studentName = cleanText(body.student_name ?? existing.student_name, 120);
+    if (!positionTitle || !studentName) return res.status(400).json({ success: false, message: 'Jabatan dan nama pengurus wajib diisi.' });
+    const studentId = body.student_id === undefined ? existing.student_id : toNumber(body.student_id);
     db.prepare(`
       UPDATE walikelas_officers
-      SET position_title = ?, student_name = ?, phone = ?, tasks = ?, avatar = ?
+      SET position_title = ?, student_id = ?, student_name = ?, phone = ?, tasks = ?, avatar = ?
       WHERE id = ?
-    `).run(position_title, student_name, phone, tasks, avatar, req.params.id);
-    res.json({ success: true, message: 'Data pengurus kelas berhasil diperbarui' });
+    `).run(positionTitle, studentId, studentName, pick('phone', 30), pick('tasks', 1000), pick('avatar', 1000), existing.id);
+    const updated = db.prepare('SELECT * FROM walikelas_officers WHERE id = ?').get(existing.id);
+    res.json({ success: true, officer: updated, message: 'Data pengurus kelas berhasil diperbarui' });
   } catch (err) {
     sendError(res, err, 'Gagal memperbarui pengurus');
   }
@@ -3223,11 +3242,21 @@ app.get('/api/walikelas/schedule', (req, res) => {
 
 app.post('/api/walikelas/schedule', (req, res) => {
   try {
-    const { day_name, period_num, time_start, time_end, subject_name, teacher_name, room } = req.body;
+    const { day_name, period_num, subject_name, teacher_name, room } = req.body || {};
+    // Normalisasi jam ke format HH:MM (data lama memakai HH.MM) agar tampilan konsisten & bisa diurutkan.
+    const normalizeClock = (value) => {
+      const match = String(value || '').trim().match(/^(\d{1,2})[.:](\d{2})$/);
+      return match ? `${match[1].padStart(2, '0')}:${match[2]}` : null;
+    };
+    const timeStart = normalizeClock(req.body?.time_start);
+    const timeEnd = normalizeClock(req.body?.time_end);
+    if (!['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'].includes(day_name)) return res.status(400).json({ success: false, message: 'Nama hari tidak valid.' });
+    if (!cleanText(subject_name, 120) || !cleanText(teacher_name, 120)) return res.status(400).json({ success: false, message: 'Mata pelajaran dan nama guru wajib diisi.' });
+    if (!timeStart || !timeEnd || timeStart >= timeEnd) return res.status(400).json({ success: false, message: 'Jam harus berformat HH:MM dan jam selesai setelah jam mulai.' });
     const result = db.prepare(`
       INSERT INTO walikelas_schedule (day_name, period_num, time_start, time_end, subject_name, teacher_name, room)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(day_name, Number(period_num) || 1, time_start, time_end, subject_name, teacher_name, room || 'R-101');
+    `).run(day_name, Math.max(1, Math.round(toNumber(period_num, 1))), timeStart, timeEnd, cleanText(subject_name, 120), cleanText(teacher_name, 120), cleanText(room, 40) || 'R-101');
     res.status(201).json({ success: true, scheduleId: result.lastInsertRowid, message: 'Jadwal pelajaran berhasil ditambahkan' });
   } catch (err) {
     sendError(res, err, 'Gagal menambahkan jadwal');

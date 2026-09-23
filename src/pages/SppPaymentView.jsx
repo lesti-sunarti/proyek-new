@@ -15,12 +15,18 @@ async function requestJson(url, options) {
 
 export default function SppPaymentView() {
   const { currentUser, currentRole, isStaff, canAccess, showToast } = useAuth();
-  // Akun ortu/siswa terhubung ke siswa lewat related_student_id; akun staf memilih siswa dari buku induk.
-  const relatedStudentId = currentUser?.related_student_id ? Number(currentUser.related_student_id) : null;
+  // Akun siswa/ortu terhubung ke satu siswa lewat currentUser.student (dari sesi login; related_student_id hanya fallback akun lama).
+  // Akun staf memilih siswa dari buku induk.
+  const isStudentAccount = currentRole === 'siswa' || currentRole === 'ortu';
+  const linkedStudent = isStudentAccount && currentUser?.student ? currentUser.student : null;
+  const relatedStudentId = linkedStudent?.id
+    ? Number(linkedStudent.id)
+    : (currentUser?.related_student_id ? Number(currentUser.related_student_id) : null);
   const canBrowseStudents = canAccess('buku_induk');
   const [students, setStudents] = useState([]);
   const [studentId, setStudentId] = useState(relatedStudentId);
-  const [studentInfo, setStudentInfo] = useState(null);
+  const [studentInfo, setStudentInfo] = useState(null); // objek student dari respons /api/spp/bills/:id
+  const [billsError, setBillsError] = useState('');
   const [sppBills, setSppBills] = useState([]);
   const [otherBills, setOtherBills] = useState([]);
   const [recap, setRecap] = useState([]);
@@ -61,18 +67,31 @@ export default function SppPaymentView() {
     if (!studentId) {
       setSppBills([]);
       setOtherBills([]);
+      setStudentInfo(null);
+      setBillsError('');
       return;
     }
     setIsLoadingBills(true);
+    setBillsError('');
     requestJson(`/api/spp/bills/${studentId}`)
       .then((data) => {
         setSppBills(Array.isArray(data.sppBills) ? data.sppBills : []);
         setOtherBills(Array.isArray(data.otherBills) ? data.otherBills : []);
+        // Identitas siswa (nama/NISN/NIS/kelas/wali) untuk kartu & kuitansi berasal dari respons tagihan.
+        setStudentInfo(data.student && typeof data.student === 'object' ? data.student : null);
       })
       .catch((error) => {
         setSppBills([]);
         setOtherBills([]);
-        showToast(error.message, 'error');
+        setStudentInfo(null);
+        // 403: akun tidak berhak / belum tertaut ke siswa; 404: siswa tidak ditemukan. Pesan server ditampilkan + arahan.
+        const message = error.status === 403
+          ? `Akses ditolak: ${error.message}${isStudentAccount ? ' Hubungi Tata Usaha untuk menautkan akun Anda.' : ''}`
+          : error.status === 404
+            ? `${error.message}${canBrowseStudents ? ' Pilih siswa lain dari daftar.' : ''}`
+            : error.message;
+        setBillsError(message);
+        showToast(message, 'error');
       })
       .finally(() => setIsLoadingBills(false));
   };
@@ -81,29 +100,10 @@ export default function SppPaymentView() {
     loadBills();
   }, [studentId]);
 
-  // Identitas siswa untuk kuitansi: dari buku induk bila ada; bila tidak (akun ortu),
-  // diambil dari riwayat presensi yang masih boleh diakses ortu.
-  useEffect(() => {
-    if (!studentId) {
-      setStudentInfo(null);
-      return;
-    }
-    const fromMaster = students.find((s) => Number(s.id) === Number(studentId));
-    if (fromMaster) {
-      setStudentInfo({ name: fromMaster.name, nisn: fromMaster.nisn, class_name: fromMaster.class_name });
-      return;
-    }
-    if (!canAccess('attendance')) {
-      setStudentInfo(null);
-      return;
-    }
-    requestJson(`/api/attendance/history?person_id=${studentId}&user_type=siswa&limit=1`)
-      .then((data) => {
-        const record = Array.isArray(data) ? data[0] : null;
-        setStudentInfo(record ? { name: record.person_name, nisn: record.person_identifier, class_name: null } : null);
-      })
-      .catch(() => setStudentInfo(null));
-  }, [studentId, students]);
+  // Identitas siswa untuk kartu & kuitansi: respons /api/spp/bills (utama) -> Buku Induk -> data siswa dari sesi login.
+  const masterStudent = students.find((s) => Number(s.id) === Number(studentId)) || null;
+  const sessionStudent = linkedStudent && Number(linkedStudent.id) === Number(studentId) ? linkedStudent : null;
+  const displayStudent = studentInfo || masterStudent || sessionStudent;
 
   const handlePayInstant = async (bill) => {
     if (payingBillId) return;
@@ -132,7 +132,7 @@ export default function SppPaymentView() {
   };
 
   const paidCount = sppBills.filter((b) => b.status === 'lunas').length;
-  const studentLabel = studentInfo?.name || (relatedStudentId ? `Siswa ID ${studentId}` : currentUser?.name || '-');
+  const studentLabel = displayStudent?.name || (studentId ? `Siswa ID ${studentId}` : currentUser?.name || '-');
 
   return (
     <div className="space-y-6">
@@ -171,7 +171,8 @@ export default function SppPaymentView() {
         ) : studentId ? (
           <div className="text-xs text-slate-600">
             <strong className="text-slate-900">{studentLabel}</strong>
-            {studentInfo?.nisn ? ` · NISN ${studentInfo.nisn}` : ''}
+            {displayStudent?.nisn ? ` · NISN ${displayStudent.nisn}` : ''}
+            {displayStudent?.class_name ? ` · ${displayStudent.class_name}` : ''}
             {currentRole === 'ortu' ? <span className="block text-[11px] text-slate-500 mt-0.5">Wali murid: {currentUser.name}</span> : null}
           </div>
         ) : (
@@ -188,7 +189,10 @@ export default function SppPaymentView() {
         </h3>
 
         {isLoadingBills && <p className="text-xs text-slate-500">Memuat tagihan…</p>}
-        {!isLoadingBills && studentId && sppBills.length === 0 && (
+        {!isLoadingBills && billsError && (
+          <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2">{billsError}</p>
+        )}
+        {!isLoadingBills && !billsError && studentId && sppBills.length === 0 && (
           <p className="text-xs text-slate-500">Belum ada tagihan SPP yang tercatat untuk siswa ini.</p>
         )}
 
@@ -266,7 +270,7 @@ export default function SppPaymentView() {
           <ShieldCheck className="w-4 h-4 text-amber-400" /> Tagihan Non-SPP & Uang Pangkal
         </h3>
 
-        {studentId && otherBills.length === 0 && !isLoadingBills && (
+        {studentId && !billsError && otherBills.length === 0 && !isLoadingBills && (
           <p className="text-xs text-slate-500">Tidak ada tagihan non-SPP untuk siswa ini.</p>
         )}
 
@@ -352,8 +356,12 @@ export default function SppPaymentView() {
               <span className="font-bold">{studentLabel}</span>
             </div>
             <div className="flex justify-between">
-              <span>NISN / Kelas:</span>
-              <span>{studentInfo?.nisn || '-'} / {studentInfo?.class_name || '-'}</span>
+              <span>NISN / NIS:</span>
+              <span>{displayStudent?.nisn || '-'} / {displayStudent?.nis || '-'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Kelas:</span>
+              <span>{displayStudent?.class_name || '-'}</span>
             </div>
             <div className="flex justify-between">
               <span>Pembayaran:</span>
@@ -381,7 +389,7 @@ export default function SppPaymentView() {
             <div>
               <p>Wali Murid,</p>
               <br /><br />
-              <p>( {currentRole === 'ortu' ? currentUser.name : '...........................'} )</p>
+              <p>( {currentRole === 'ortu' ? currentUser.name : (displayStudent?.parent_name || '...........................')} )</p>
             </div>
             <div>
               <p>Petugas Kasir Keuangan,</p>

@@ -1287,35 +1287,35 @@ export function initDatabase() {
     const insertSched = db.prepare('INSERT INTO walikelas_schedule (day_name, period_num, time_start, time_end, subject_name, teacher_name, room) VALUES (?, ?, ?, ?, ?, ?, ?)');
     
     // Senin
-    insertSched.run('Senin', 1, '07.00', '07.45', 'Upacara Bendera', 'Dra. Hj. Nurhayati, M.M.', 'Lapangan Utama');
-    insertSched.run('Senin', 2, '07.45', '09.15', 'Matematika Peminatan', 'Bambang Sutedjo, M.Pd.', 'R-101');
-    insertSched.run('Senin', 3, '09.30', '11.00', 'Fisika Terapan', 'Dr. Ir. Hendra Saputra', 'Lab Fisika');
-    insertSched.run('Senin', 4, '11.00', '12.00', 'Bahasa Indonesia', 'Siti Rahmawati, S.Pd.', 'R-101');
-    insertSched.run('Senin', 5, '12.45', '14.15', 'Informatika & Coding', 'Ahmad Zaki, M.Kom.', 'Lab Komputer 1');
+    insertSched.run('Senin', 1, '07:00', '07:45', 'Upacara Bendera', 'Dra. Hj. Nurhayati, M.M.', 'Lapangan Utama');
+    insertSched.run('Senin', 2, '07:45', '09:15', 'Matematika Peminatan', 'Bambang Sutedjo, M.Pd.', 'R-101');
+    insertSched.run('Senin', 3, '09:30', '11:00', 'Fisika Terapan', 'Dr. Ir. Hendra Saputra', 'Lab Fisika');
+    insertSched.run('Senin', 4, '11:00', '12:00', 'Bahasa Indonesia', 'Siti Rahmawati, S.Pd.', 'R-101');
+    insertSched.run('Senin', 5, '12:45', '14:15', 'Informatika & Coding', 'Ahmad Zaki, M.Kom.', 'Lab Komputer 1');
 
     // Selasa
-    insertSched.run('Selasa', 1, '07.00', '08.30', 'Biologi Molekuler', 'Dra. Endang Sulastri', 'Lab Biologi');
-    insertSched.run('Selasa', 2, '08.30', '10.00', 'Kimia Analitik', 'Arief Rahman, M.Si.', 'Lab Kimia');
-    insertSched.run('Selasa', 3, '10.15', '11.45', 'Bahasa Inggris', 'Robert Anderson, B.Ed.', 'R-101');
-    insertSched.run('Selasa', 4, '12.30', '14.00', 'Pendidikan Agama & Budi Pekerti', 'Ust. Muhammad Ilyas, M.Pd.I.', 'Masjid Sekolah');
+    insertSched.run('Selasa', 1, '07:00', '08:30', 'Biologi Molekuler', 'Dra. Endang Sulastri', 'Lab Biologi');
+    insertSched.run('Selasa', 2, '08:30', '10:00', 'Kimia Analitik', 'Arief Rahman, M.Si.', 'Lab Kimia');
+    insertSched.run('Selasa', 3, '10:15', '11:45', 'Bahasa Inggris', 'Robert Anderson, B.Ed.', 'R-101');
+    insertSched.run('Selasa', 4, '12:30', '14:00', 'Pendidikan Agama & Budi Pekerti', 'Ust. Muhammad Ilyas, M.Pd.I.', 'Masjid Sekolah');
 
     // Rabu
-    insertSched.run('Rabu', 1, '07.00', '08.30', 'Pendidikan Jasmani (Olahraga)', 'Guntur Wibowo, S.Pd.', 'GOR Sekolah');
-    insertSched.run('Rabu', 2, '08.30', '10.00', 'Sejarah Indonesia', 'Sri Wahyuni, M.Pd.', 'R-101');
-    insertSched.run('Rabu', 3, '10.15', '11.45', 'Pendidikan Pancasila & P5', 'Dra. Hj. Nurhayati, M.M.', 'R-101');
-    insertSched.run('Rabu', 4, '12.30', '14.00', 'Seni Budaya & Keterampilan', 'Dewi Sartika, S.Sn.', 'R-101');
+    insertSched.run('Rabu', 1, '07:00', '08:30', 'Pendidikan Jasmani (Olahraga)', 'Guntur Wibowo, S.Pd.', 'GOR Sekolah');
+    insertSched.run('Rabu', 2, '08:30', '10:00', 'Sejarah Indonesia', 'Sri Wahyuni, M.Pd.', 'R-101');
+    insertSched.run('Rabu', 3, '10:15', '11:45', 'Pendidikan Pancasila & P5', 'Dra. Hj. Nurhayati, M.M.', 'R-101');
+    insertSched.run('Rabu', 4, '12:30', '14:00', 'Seni Budaya & Keterampilan', 'Dewi Sartika, S.Sn.', 'R-101');
 
     // Kamis
-    insertSched.run('Kamis', 1, '07.00', '08.30', 'Matematika Wajib', 'Bambang Sutedjo, M.Pd.', 'R-101');
-    insertSched.run('Kamis', 2, '08.30', '10.00', 'Geografi & Kebumian', 'Haryanto, S.Pd.', 'R-101');
-    insertSched.run('Kamis', 3, '10.15', '11.45', 'Sosiologi & Karakter', 'Dra. Marlina', 'R-101');
-    insertSched.run('Kamis', 4, '12.30', '14.00', 'Bimbingan Konseling & Karir', 'Rahmat Hidayat, M.Psi.', 'R-101');
+    insertSched.run('Kamis', 1, '07:00', '08:30', 'Matematika Wajib', 'Bambang Sutedjo, M.Pd.', 'R-101');
+    insertSched.run('Kamis', 2, '08:30', '10:00', 'Geografi & Kebumian', 'Haryanto, S.Pd.', 'R-101');
+    insertSched.run('Kamis', 3, '10:15', '11:45', 'Sosiologi & Karakter', 'Dra. Marlina', 'R-101');
+    insertSched.run('Kamis', 4, '12:30', '14:00', 'Bimbingan Konseling & Karir', 'Rahmat Hidayat, M.Psi.', 'R-101');
 
     // Jumat
-    insertSched.run('Jumat', 1, '07.00', '07.45', 'Senam Sehat & Literasi Pagi', 'Seluruh Guru & Siswa', 'Lapangan Utama');
-    insertSched.run('Jumat', 2, '07.45', '09.15', 'Prakarya & Kewirausahaan', 'Ratna Juwita, S.E.', 'R-101');
-    insertSched.run('Jumat', 3, '09.30', '11.00', 'Ekonomi Terapan', 'Ratna Juwita, S.E.', 'R-101');
-    insertSched.run('Jumat', 4, '13.00', '14.30', 'Ekstrakurikuler Wajib Pramuka', 'Kak Pembina Pramuka', 'Lapangan & Aula');
+    insertSched.run('Jumat', 1, '07:00', '07:45', 'Senam Sehat & Literasi Pagi', 'Seluruh Guru & Siswa', 'Lapangan Utama');
+    insertSched.run('Jumat', 2, '07:45', '09:15', 'Prakarya & Kewirausahaan', 'Ratna Juwita, S.E.', 'R-101');
+    insertSched.run('Jumat', 3, '09:30', '11:00', 'Ekonomi Terapan', 'Ratna Juwita, S.E.', 'R-101');
+    insertSched.run('Jumat', 4, '13:00', '14:30', 'Ekstrakurikuler Wajib Pramuka', 'Kak Pembina Pramuka', 'Lapangan & Aula');
   }
 
   // Seeding Presensi Hari Ini
@@ -1392,6 +1392,9 @@ export function initDatabase() {
     insertDoc.run('Surat Izin Orang Tua: Study Tour & Riset Ilmiah Kebun Raya', 'Surat Izin', today, '#', '32 berkas terkumpul lengkap');
     insertDoc.run('Piagam Juara Umum Kelas Terbersih & Terdisiplin Bulan Agustus', 'Prestasi', '2025-08-31', '#', 'Penghargaan dari Kepala Sekolah');
   }
+
+  // Normalisasi format jam jadwal wali kelas pada instalasi lama (HH.MM → HH:MM) agar konsisten & terurut.
+  db.prepare("UPDATE walikelas_schedule SET time_start = replace(time_start, '.', ':'), time_end = replace(time_end, '.', ':') WHERE time_start LIKE '%.%' OR time_end LIKE '%.%'").run();
 
   console.log('✅ SQLite Schema initialized successfully (including Kantin, Dompet, Pemilos & SISTEM WALI KELAS).');
 

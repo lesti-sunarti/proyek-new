@@ -67,6 +67,26 @@ const makeJournalForm = () => ({
   incident_notes: '',
   status: 'Terlaksana'
 });
+// Saran jabatan pengurus kelas (datalist; tetap boleh mengetik jabatan lain).
+const OFFICER_POSITIONS = [
+  'Ketua Kelas', 'Wakil Ketua Kelas', 'Sekretaris 1', 'Sekretaris 2', 'Bendahara 1', 'Bendahara 2',
+  'Seksi Kebersihan', 'Seksi Keamanan', 'Seksi Keagamaan', 'Seksi Olahraga', 'Seksi Kesenian', 'Seksi Pembelajaran'
+];
+const makeOfficerForm = () => ({ position_title: '', student_id: '', student_name: '', phone: '', tasks: '', avatar: '' });
+const makeScheduleForm = (day = 'Senin') => ({
+  day_name: day, period_num: 1, time_start: '', time_end: '', subject_name: '', teacher_name: '', room: ''
+});
+// 'HH:MM' (input type=time) atau 'HH.MM' (data seed) → menit sejak 00:00; NaN bila format tidak dikenali.
+const timeToMinutes = (t) => {
+  const m = /^(\d{1,2})[:.](\d{2})$/.exec(String(t || '').trim());
+  if (!m) return NaN;
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (h > 23 || mi > 59) return NaN;
+  return h * 60 + mi;
+};
+const INVENTORY_CONDITIONS = ['Baik', 'Rusak Ringan', 'Rusak Berat'];
+const makeInventoryForm = () => ({ item_name: '', quantity: 1, unit: 'Unit', condition: 'Baik', notes: '' });
 
 const DEFAULT_DASHBOARD_DATA = {
   success: true,
@@ -176,6 +196,8 @@ const StatCard = ({ icon: Icon, label, value, sub, color = 'emerald' }) => {
 };
 
 const DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat'];
+// Roster pelajaran menerima Senin s/d Sabtu (kontrak server); DAYS (Senin-Jumat) tetap dipakai jadwal piket.
+const SCHEDULE_DAYS = [...DAYS, 'Sabtu'];
 
 // ============================================================================
 // 1. DASHBOARD TAB
@@ -761,23 +783,142 @@ function DataSiswaTab() {
 function PengurusTab() {
   const { showToast } = useAuth();
   const [officers, setOfficers] = useState([]);
+  const [students, setStudents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const [editOfficer, setEditOfficer] = useState(null);
+  const [form, setForm] = useState(makeOfficerForm);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadOfficers = () => {
     setLoading(true);
-    apiFetch('/officers')
-      .then(setOfficers)
+    // Daftar siswa rombel dipakai untuk dropdown agar student_id & student_name terisi konsisten.
+    Promise.all([apiFetch('/officers'), apiFetch('/students')])
+      .then(([oList, sList]) => {
+        setOfficers(Array.isArray(oList) ? oList : []);
+        setStudents(Array.isArray(sList) ? sList : []);
+      })
       .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => { loadOfficers(); }, []);
 
+  const openAddModal = () => {
+    setEditOfficer(null);
+    setForm(makeOfficerForm());
+    setShowModal(true);
+  };
+
+  const openEditModal = (o) => {
+    setEditOfficer(o);
+    // Semua nilai lama dimuat ke form karena PUT di server menimpa seluruh kolom.
+    setForm({
+      position_title: o.position_title || '',
+      student_id: o.student_id ? String(o.student_id) : '',
+      student_name: o.student_name || '',
+      phone: o.phone || '',
+      tasks: o.tasks || '',
+      avatar: o.avatar || ''
+    });
+    setShowModal(true);
+  };
+
+  // Pilih siswa dari rombel → student_id & student_name terisi otomatis.
+  // Opsi kosong = nama diisi manual (mis. wali kelas / pembina yang bukan siswa).
+  const handleStudentSelect = (sid) => {
+    if (!sid) {
+      setForm(f => ({ ...f, student_id: '' }));
+      return;
+    }
+    const st = students.find(s => String(s.id) === String(sid));
+    setForm(f => ({
+      ...f,
+      student_id: String(sid),
+      student_name: st?.name || f.student_name,
+      phone: f.phone || st?.phone_student || ''
+    }));
+  };
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    const position_title = form.position_title.trim();
+    const student_name = form.student_name.trim();
+    if (!position_title) {
+      showToast('Jabatan pengurus wajib diisi', 'error');
+      return;
+    }
+    if (!student_name) {
+      showToast('Pilih siswa dari rombel atau isi nama pengurus terlebih dahulu', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        position_title,
+        student_id: form.student_id ? Number(form.student_id) : null,
+        student_name,
+        phone: form.phone.trim() || null,
+        tasks: form.tasks.trim() || null,
+        avatar: form.avatar.trim() || null,
+      };
+      if (editOfficer) {
+        // Catatan: PUT server hanya memperbarui position_title, student_name, phone, tasks, avatar (student_id diabaikan).
+        const res = await apiFetch(`/officers/${editOfficer.id}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload)
+        });
+        showToast(res?.message || 'Data pengurus kelas berhasil diperbarui', 'success');
+      } else {
+        const res = await apiFetch('/officers', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        showToast(res?.message || 'Pengurus kelas berhasil ditambahkan', 'success');
+      }
+      setShowModal(false);
+      loadOfficers();
+    } catch (err) {
+      showToast(err.message || 'Gagal menyimpan pengurus kelas', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (o) => {
+    if (!window.confirm(`Hapus ${o.position_title} "${o.student_name}" dari struktur pengurus kelas?`)) return;
+    setDeletingId(o.id);
+    try {
+      const res = await apiFetch(`/officers/${o.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Pengurus kelas berhasil dihapus', 'success');
+      loadOfficers();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghapus pengurus kelas', 'error');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   if (loading) return <Spinner />;
+
+  const selectedStudent = students.find(s => String(s.id) === String(form.student_id));
 
   return (
     <div>
-      <SectionTitle icon={UserCog} title="Struktur Organisasi Kelas" desc="Pengurus kelas masa bakti 2025/2026" />
+      <SectionTitle
+        icon={UserCog}
+        title="Struktur Organisasi Kelas"
+        desc={`Pengurus kelas masa bakti 2025/2026 — ${officers.length} jabatan tercatat`}
+        action={
+          <button
+            onClick={openAddModal}
+            className="flex items-center gap-1.5 px-4 py-2 bg-[#002147] hover:bg-blue-900 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+          >
+            <Plus size={14} /> Tambah Pengurus
+          </button>
+        }
+      />
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {officers.map(o => (
           <div key={o.id} className="bg-white rounded-xl border border-gray-200 p-4 shadow-xs flex items-start gap-3.5 hover:shadow-md transition-shadow">
@@ -785,9 +926,29 @@ function PengurusTab() {
               {o.student_name?.charAt(0) || 'S'}
             </div>
             <div className="flex-1 min-w-0">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 inline-block mb-1">
-                {o.position_title}
-              </span>
+              <div className="flex items-start justify-between gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 inline-block mb-1">
+                  {o.position_title}
+                </span>
+                <div className="flex items-center gap-0.5 shrink-0">
+                  <button
+                    onClick={() => openEditModal(o)}
+                    disabled={deletingId === o.id}
+                    className="p-1.5 hover:bg-blue-50 text-blue-700 rounded transition-colors disabled:opacity-50"
+                    title="Edit pengurus"
+                  >
+                    <Edit3 size={13} />
+                  </button>
+                  <button
+                    onClick={() => handleDelete(o)}
+                    disabled={deletingId === o.id}
+                    className="p-1.5 hover:bg-red-50 text-red-600 rounded transition-colors disabled:opacity-50"
+                    title="Hapus pengurus"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
               <p className="font-bold text-gray-900 text-sm truncate">{o.student_name}</p>
               {o.tasks && <p className="text-xs text-gray-500 mt-1 line-clamp-2">{o.tasks}</p>}
               {o.phone && (
@@ -801,7 +962,120 @@ function PengurusTab() {
       </div>
       {officers.length === 0 && (
         <div className="text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
-          Belum ada data pengurus kelas.
+          Belum ada data pengurus kelas. Klik "Tambah Pengurus" untuk memulai.
+        </div>
+      )}
+
+      {/* Modal Tambah/Edit Pengurus */}
+      {showModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-gray-100 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-gray-100">
+              <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2">
+                <UserCog size={16} className="text-[#002147]" />
+                {editOfficer ? 'Edit Pengurus Kelas' : 'Tambah Pengurus Kelas'}
+              </h3>
+              <button onClick={() => setShowModal(false)} className="text-gray-400 hover:text-gray-600">
+                <X size={16} />
+              </button>
+            </div>
+            <form onSubmit={handleSave} className="space-y-3 text-xs">
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Jabatan *</label>
+                <input
+                  type="text"
+                  required
+                  list="walikelas-officer-positions"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="Ketua Kelas, Sekretaris 1, Seksi Kebersihan..."
+                  value={form.position_title}
+                  onChange={e => setForm({ ...form, position_title: e.target.value })}
+                />
+                <datalist id="walikelas-officer-positions">
+                  {OFFICER_POSITIONS.map(p => <option key={p} value={p} />)}
+                </datalist>
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Siswa Rombel</label>
+                <select
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  value={form.student_id}
+                  onChange={e => handleStudentSelect(e.target.value)}
+                >
+                  <option value="">— Bukan siswa rombel / isi nama manual —</option>
+                  {students.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}{s.nis ? ` (${s.nis})` : ''}
+                    </option>
+                  ))}
+                </select>
+                {students.length === 0 && (
+                  <p className="text-[10px] text-amber-700 mt-1">Belum ada siswa di rombel; isi nama pengurus secara manual.</p>
+                )}
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Nama Pengurus *</label>
+                <input
+                  type="text"
+                  required
+                  readOnly={!!selectedStudent}
+                  className={`w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none ${selectedStudent ? 'bg-gray-50 text-gray-600' : ''}`}
+                  placeholder="Nama lengkap pengurus"
+                  value={form.student_name}
+                  onChange={e => setForm({ ...form, student_name: e.target.value })}
+                />
+                {selectedStudent && (
+                  <p className="text-[10px] text-gray-400 mt-1">Nama diambil dari data siswa rombel (NIS {selectedStudent.nis || '-'}).</p>
+                )}
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">No. HP / Kontak</label>
+                <input
+                  type="text"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="0812-xxxx-xxxx"
+                  value={form.phone}
+                  onChange={e => setForm({ ...form, phone: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Uraian Tugas</label>
+                <textarea
+                  rows={3}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="Memimpin kelas, mengkoordinir teman sekelas, menjadi jembatan komunikasi ke guru..."
+                  value={form.tasks}
+                  onChange={e => setForm({ ...form, tasks: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">URL Foto (opsional)</label>
+                <input
+                  type="text"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="https://... atau /uploads/..."
+                  value={form.avatar}
+                  onChange={e => setForm({ ...form, avatar: e.target.value })}
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => setShowModal(false)}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="flex items-center gap-1 px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold disabled:opacity-50"
+                >
+                  <Save size={13} /> {saving ? 'Menyimpan...' : (editOfficer ? 'Simpan Perubahan' : 'Simpan Pengurus')}
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
     </div>
@@ -990,15 +1264,22 @@ function PiketTab() {
 function DenahTab() {
   const { showToast } = useAuth();
   const [seats, setSeats] = useState([]);
+  const [students, setStudents] = useState([]);
   const [selectedSeat, setSelectedSeat] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
+  // Kursi kosong yang sedang diisi lewat modal "Tempatkan Siswa" + siswa yang dipilih di dropdown.
+  const [assignSeat, setAssignSeat] = useState(null);
+  const [assignStudentId, setAssignStudentId] = useState('');
 
   const loadSeats = () => {
     setLoading(true);
-    apiFetch('/seating')
-      .then(setSeats)
+    Promise.all([apiFetch('/seating'), apiFetch('/students')])
+      .then(([seatList, studentList]) => {
+        setSeats(Array.isArray(seatList) ? seatList : []);
+        setStudents(Array.isArray(studentList) ? studentList : []);
+      })
       .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
@@ -1031,7 +1312,71 @@ function DenahTab() {
     }
   };
 
+  const openAssignModal = (seat) => {
+    setSelectedSeat(null);
+    setMessage('');
+    setAssignStudentId('');
+    setAssignSeat(seat);
+  };
+
+  // Tempatkan siswa pada kursi kosong → PUT /seating/:id {student_id, student_name}
+  const handleAssign = async (e) => {
+    e.preventDefault();
+    if (!assignSeat) return;
+    const st = students.find(s => String(s.id) === String(assignStudentId));
+    if (!st) {
+      showToast('Pilih siswa yang akan ditempatkan terlebih dahulu', 'error');
+      return;
+    }
+    const otherSeat = seats.find(s => s.id !== assignSeat.id && s.student_id != null && String(s.student_id) === String(st.id));
+    if (otherSeat) {
+      showToast(`${st.name} sudah duduk di Kursi ${otherSeat.desk_number}. Gunakan tukar posisi atau kosongkan kursi tersebut dahulu.`, 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`/seating/${assignSeat.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ student_id: Number(st.id), student_name: st.name })
+      });
+      showToast(res?.message || 'Tempat duduk berhasil diperbarui', 'success');
+      setMessage(`✅ ${st.name} ditempatkan di Kursi ${assignSeat.desk_number}.`);
+      setAssignSeat(null);
+      loadSeats();
+    } catch (err) {
+      showToast(err.message || 'Gagal menempatkan siswa', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Kosongkan kursi → PUT /seating/:id dengan student_id & student_name null
+  const handleClearSeat = async (seat) => {
+    if (!window.confirm(`Kosongkan Kursi ${seat.desk_number} (${seat.student_name || 'tanpa nama'})?`)) return;
+    setSaving(true);
+    try {
+      const res = await apiFetch(`/seating/${seat.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ student_id: null, student_name: null })
+      });
+      showToast(res?.message || 'Tempat duduk berhasil dikosongkan', 'success');
+      if (selectedSeat?.id === seat.id) setSelectedSeat(null);
+      setMessage(`Kursi ${seat.desk_number} kini kosong.`);
+      loadSeats();
+    } catch (err) {
+      showToast(err.message || 'Gagal mengosongkan kursi', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (loading) return <Spinner />;
+
+  // Peta student_id → kursi yang ditempati, untuk menandai siswa yang sudah duduk di kursi lain pada dropdown.
+  const seatByStudentId = new Map();
+  (Array.isArray(seats) ? seats : []).forEach(s => {
+    if (s.student_id !== null && s.student_id !== undefined) seatByStudentId.set(String(s.student_id), s);
+  });
 
   // Di database, desk_number adalah NOMOR KURSI (1..32); satu meja = dua kursi dengan row_num & col_num sama.
   // Kelompokkan berdasarkan posisi (baris, kolom) agar seluruh kursi tampil, bukan hanya 16 kursi pertama.
@@ -1058,7 +1403,7 @@ function DenahTab() {
       <SectionTitle
         icon={Grid3X3}
         title="Denah Tempat Duduk Kelas"
-        desc="Klik dua kursi berturut-turut untuk menukar posisi duduk siswa secara instan"
+        desc="Klik dua kursi berturut-turut untuk menukar posisi; pakai 'Tempatkan' pada kursi kosong atau 'Kosongkan' pada kursi terisi"
         action={
           <button
             onClick={() => { setSelectedSeat(null); loadSeats(); }}
@@ -1097,27 +1442,51 @@ function DenahTab() {
             <div className="grid grid-cols-2 gap-1.5">
               {pair.map(s => {
                 const isSelected = selectedSeat?.id === s.id;
+                const isOccupied = Boolean(s.student_name) || (s.student_id !== null && s.student_id !== undefined);
                 return (
-                  <button
-                    key={s.id}
-                    onClick={() => handleSeatClick(s)}
-                    disabled={saving}
-                    className={`min-h-[4.5rem] p-1 rounded-lg text-center flex flex-col items-center justify-center transition-all duration-150 border-2 ${
-                      isSelected
-                        ? 'bg-amber-400 border-amber-600 text-amber-950 scale-105 shadow-md font-bold'
-                        : s.student_name
-                        ? 'bg-white border-gray-300 hover:border-emerald-500 hover:bg-emerald-50 text-gray-800'
-                        : 'bg-gray-100 border-dashed border-gray-300 text-gray-400'
-                    }`}
-                  >
-                    <User size={13} className={s.student_name ? 'text-emerald-700 mb-0.5' : 'text-gray-300 mb-0.5'} />
-                    <span className="text-[10px] font-bold leading-tight line-clamp-2 px-0.5">
-                      {s.student_name || 'Kosong'}
-                    </span>
-                    <span className="text-[9px] text-gray-400 mt-0.5">
-                      Kursi {s.desk_number} · B{s.row_num}K{s.col_num}
-                    </span>
-                  </button>
+                  <div key={s.id} className="flex flex-col gap-1">
+                    <button
+                      onClick={() => handleSeatClick(s)}
+                      disabled={saving}
+                      title={isOccupied ? 'Klik untuk memilih/menukar posisi' : 'Kursi kosong — klik untuk memilih/menukar, atau gunakan "Tempatkan"'}
+                      className={`min-h-[4.5rem] p-1 rounded-lg text-center flex flex-col items-center justify-center transition-all duration-150 border-2 ${
+                        isSelected
+                          ? 'bg-amber-400 border-amber-600 text-amber-950 scale-105 shadow-md font-bold'
+                          : s.student_name
+                          ? 'bg-white border-gray-300 hover:border-emerald-500 hover:bg-emerald-50 text-gray-800'
+                          : 'bg-gray-100 border-dashed border-gray-300 text-gray-400'
+                      }`}
+                    >
+                      <User size={13} className={s.student_name ? 'text-emerald-700 mb-0.5' : 'text-gray-300 mb-0.5'} />
+                      <span className="text-[10px] font-bold leading-tight line-clamp-2 px-0.5">
+                        {s.student_name || 'Kosong'}
+                      </span>
+                      <span className="text-[9px] text-gray-400 mt-0.5">
+                        Kursi {s.desk_number} · B{s.row_num}K{s.col_num}
+                      </span>
+                    </button>
+                    {isOccupied ? (
+                      <button
+                        type="button"
+                        onClick={() => handleClearSeat(s)}
+                        disabled={saving}
+                        className="w-full flex items-center justify-center gap-1 text-[10px] font-semibold text-red-600 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-md py-0.5 transition-colors disabled:opacity-50"
+                        title="Kosongkan kursi ini"
+                      >
+                        <X size={10} /> Kosongkan
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => openAssignModal(s)}
+                        disabled={saving}
+                        className="w-full flex items-center justify-center gap-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200 rounded-md py-0.5 transition-colors disabled:opacity-50"
+                        title="Tempatkan siswa di kursi ini"
+                      >
+                        <Plus size={10} /> Tempatkan
+                      </button>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -1127,6 +1496,67 @@ function DenahTab() {
       {desks.length === 0 && (
         <div className="max-w-4xl mx-auto text-center py-10 bg-white rounded-xl border border-dashed border-gray-200 text-gray-400 text-xs">
           Belum ada data denah tempat duduk.
+        </div>
+      )}
+
+      {/* Modal Tempatkan Siswa pada kursi kosong */}
+      {assignSeat && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-gray-100">
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-gray-100">
+              <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2">
+                <Grid3X3 size={16} className="text-[#002147]" />
+                Tempatkan Siswa — Kursi {assignSeat.desk_number}
+              </h3>
+              <button onClick={() => setAssignSeat(null)} className="text-gray-400 hover:text-gray-600">
+                <X size={16} />
+              </button>
+            </div>
+            <form onSubmit={handleAssign} className="space-y-3 text-xs">
+              <p className="text-gray-500">
+                Posisi: Baris {assignSeat.row_num}, Kolom {assignSeat.col_num}. Siswa yang sudah menempati kursi lain ditandai dan tidak dapat dipilih.
+              </p>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Pilih Siswa *</label>
+                <select
+                  required
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  value={assignStudentId}
+                  onChange={e => setAssignStudentId(e.target.value)}
+                >
+                  <option value="">— Pilih siswa rombel —</option>
+                  {students.map(st => {
+                    const occupiedSeat = seatByStudentId.get(String(st.id));
+                    const seatedElsewhere = Boolean(occupiedSeat) && occupiedSeat.id !== assignSeat.id;
+                    return (
+                      <option key={st.id} value={st.id} disabled={seatedElsewhere}>
+                        {st.name}{seatedElsewhere ? ` — sudah duduk di Kursi ${occupiedSeat.desk_number}` : ''}
+                      </option>
+                    );
+                  })}
+                </select>
+                {students.length === 0 && (
+                  <p className="text-[10px] text-amber-700 mt-1">Belum ada siswa di rombel. Tambahkan siswa pada tab Data Siswa terlebih dahulu.</p>
+                )}
+              </div>
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => setAssignSeat(null)}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving || students.length === 0}
+                  className="flex items-center gap-1 px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold disabled:opacity-50"
+                >
+                  <Save size={13} /> {saving ? 'Menyimpan...' : 'Tempatkan'}
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
     </div>
@@ -1142,6 +1572,8 @@ function TataTertibTab() {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ category: 'Disiplin', title: '', description: '', points: 5 });
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadRules = () => {
     setLoading(true);
@@ -1159,6 +1591,7 @@ function TataTertibTab() {
       showToast('Bunyi aturan wajib diisi', 'error');
       return;
     }
+    setSaving(true);
     try {
       const res = await apiFetch('/rules', {
         method: 'POST',
@@ -1175,16 +1608,22 @@ function TataTertibTab() {
       loadRules();
     } catch (err) {
       showToast(err.message || 'Gagal menambah aturan', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (id) => {
-    if (!window.confirm('Hapus tata tertib ini?')) return;
+  const handleDelete = async (r) => {
+    if (!window.confirm(`Hapus tata tertib "${r.title}"?`)) return;
+    setDeletingId(r.id);
     try {
-      await apiFetch(`/rules/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/rules/${r.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Tata tertib berhasil dihapus', 'success');
       loadRules();
     } catch (err) {
       showToast(err.message || 'Gagal menghapus aturan', 'error');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -1222,8 +1661,9 @@ function TataTertibTab() {
                     +{r.points} Poin
                   </span>
                   <button
-                    onClick={() => handleDelete(r.id)}
-                    className="text-gray-400 hover:text-red-600 p-1"
+                    onClick={() => handleDelete(r)}
+                    disabled={deletingId === r.id}
+                    className="text-gray-400 hover:text-red-600 p-1 disabled:opacity-50"
                     title="Hapus aturan"
                   >
                     <Trash2 size={13} />
@@ -1308,9 +1748,10 @@ function TataTertibTab() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold"
+                  disabled={saving}
+                  className="px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold disabled:opacity-50"
                 >
-                  Simpan Aturan
+                  {saving ? 'Menyimpan...' : 'Simpan Aturan'}
                 </button>
               </div>
             </form>
@@ -1329,16 +1770,103 @@ function JadwalTab() {
   const [schedule, setSchedule] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedDay, setSelectedDay] = useState('all');
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState(() => makeScheduleForm());
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadSchedule = () => {
     setLoading(true);
     apiFetch(`/schedule?day=${selectedDay}`)
-      .then(setSchedule)
+      .then(list => setSchedule(Array.isArray(list) ? list : []))
       .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => { loadSchedule(); }, [selectedDay]);
+
+  // Server hanya mengurutkan berdasarkan jam ke; pada tampilan "Semua Hari" urutkan per hari lalu jam ke.
+  const sortedSchedule = useMemo(() => {
+    const dayIndex = (d) => {
+      const i = SCHEDULE_DAYS.indexOf(d);
+      return i === -1 ? SCHEDULE_DAYS.length : i;
+    };
+    return [...schedule].sort((a, b) =>
+      (dayIndex(a.day_name) - dayIndex(b.day_name)) ||
+      ((Number(a.period_num) || 0) - (Number(b.period_num) || 0)) ||
+      ((Number(a.id) || 0) - (Number(b.id) || 0))
+    );
+  }, [schedule]);
+
+  const openAddModal = () => {
+    setForm(makeScheduleForm(selectedDay !== 'all' ? selectedDay : 'Senin'));
+    setShowAdd(true);
+  };
+
+  const handleAdd = async (e) => {
+    e.preventDefault();
+    const subject_name = form.subject_name.trim();
+    const teacher_name = form.teacher_name.trim();
+    const period_num = Number(form.period_num);
+    if (!SCHEDULE_DAYS.includes(form.day_name)) {
+      showToast('Pilih hari yang valid (Senin s/d Sabtu)', 'error');
+      return;
+    }
+    if (!Number.isInteger(period_num) || period_num < 1) {
+      showToast('Jam ke harus berupa angka bulat minimal 1', 'error');
+      return;
+    }
+    const start = timeToMinutes(form.time_start);
+    const end = timeToMinutes(form.time_end);
+    if (Number.isNaN(start) || Number.isNaN(end)) {
+      showToast('Jam mulai dan jam selesai wajib diisi dengan format HH:MM', 'error');
+      return;
+    }
+    if (end <= start) {
+      showToast('Jam selesai harus lebih besar dari jam mulai', 'error');
+      return;
+    }
+    if (!subject_name || !teacher_name) {
+      showToast('Mata pelajaran dan guru pengampu wajib diisi', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch('/schedule', {
+        method: 'POST',
+        body: JSON.stringify({
+          day_name: form.day_name,
+          period_num,
+          time_start: form.time_start,
+          time_end: form.time_end,
+          subject_name,
+          teacher_name,
+          room: form.room.trim() || null
+        })
+      });
+      showToast(res?.message || 'Jadwal pelajaran berhasil ditambahkan', 'success');
+      setShowAdd(false);
+      loadSchedule();
+    } catch (err) {
+      showToast(err.message || 'Gagal menambahkan jadwal', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (s) => {
+    if (!window.confirm(`Hapus jadwal ${s.subject_name} (${s.day_name}, jam ke-${s.period_num})?`)) return;
+    setDeletingId(s.id);
+    try {
+      const res = await apiFetch(`/schedule/${s.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Jadwal pelajaran berhasil dihapus', 'success');
+      loadSchedule();
+    } catch (err) {
+      showToast(err.message || 'Gagal menghapus jadwal', 'error');
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   return (
     <div>
@@ -1347,18 +1875,26 @@ function JadwalTab() {
         title="Jadwal Pelajaran KBM Rombel"
         desc="Roster jam pelajaran kelas X MIPA 1 per hari"
         action={
-          <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
-            {['all', ...DAYS].map(d => (
-              <button
-                key={d}
-                onClick={() => setSelectedDay(d)}
-                className={`px-3 py-1 rounded-md text-xs font-semibold transition-colors ${
-                  selectedDay === d ? 'bg-[#002147] text-white' : 'text-gray-600 hover:text-gray-900'
-                }`}
-              >
-                {d === 'all' ? 'Semua Hari' : d}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex gap-1 bg-gray-100 p-1 rounded-lg overflow-x-auto">
+              {['all', ...SCHEDULE_DAYS].map(d => (
+                <button
+                  key={d}
+                  onClick={() => setSelectedDay(d)}
+                  className={`px-3 py-1 rounded-md text-xs font-semibold transition-colors whitespace-nowrap ${
+                    selectedDay === d ? 'bg-[#002147] text-white' : 'text-gray-600 hover:text-gray-900'
+                  }`}
+                >
+                  {d === 'all' ? 'Semua Hari' : d}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={openAddModal}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+            >
+              <Plus size={14} /> Tambah Jadwal
+            </button>
           </div>
         }
       />
@@ -1374,10 +1910,11 @@ function JadwalTab() {
               <th className="px-3 py-2.5 text-left">Mata Pelajaran</th>
               <th className="px-3 py-2.5 text-left">Guru Pengampu</th>
               <th className="px-3 py-2.5 text-center w-24">Ruang</th>
+              <th className="px-3 py-2.5 text-center w-14">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {schedule.map(s => (
+            {sortedSchedule.map(s => (
               <tr key={s.id} className="hover:bg-gray-50">
                 <td className="px-3 py-2 text-center font-bold text-[#002147] whitespace-nowrap">{s.day_name}</td>
                 <td className="px-3 py-2 text-center font-bold text-gray-700">{s.period_num}</td>
@@ -1386,19 +1923,143 @@ function JadwalTab() {
                 </td>
                 <td className="px-3 py-2 font-bold text-gray-900">{s.subject_name}</td>
                 <td className="px-3 py-2 text-gray-600">{s.teacher_name}</td>
-                <td className="px-3 py-2 text-center font-semibold text-gray-500">{s.room}</td>
+                <td className="px-3 py-2 text-center font-semibold text-gray-500">{s.room || '-'}</td>
+                <td className="px-3 py-2 text-center">
+                  <button
+                    onClick={() => handleDelete(s)}
+                    disabled={deletingId === s.id}
+                    className="text-gray-400 hover:text-red-600 p-1 disabled:opacity-50"
+                    title="Hapus jadwal"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </td>
               </tr>
             ))}
-            {schedule.length === 0 && (
+            {sortedSchedule.length === 0 && (
               <tr>
-                <td colSpan={6} className="text-center py-8 text-gray-400">
-                  Belum ada jadwal pelajaran{selectedDay !== 'all' ? ` untuk hari ${selectedDay}` : ''}.
+                <td colSpan={7} className="text-center py-8 text-gray-400">
+                  Belum ada jadwal pelajaran{selectedDay !== 'all' ? ` untuk hari ${selectedDay}` : ''}. Klik "Tambah Jadwal" untuk menambahkan.
                 </td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+      )}
+
+      {/* Modal Tambah Jadwal */}
+      {showAdd && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-gray-100 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-gray-100">
+              <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2">
+                <BookOpen size={16} className="text-[#002147]" />
+                Tambah Jadwal Pelajaran
+              </h3>
+              <button onClick={() => setShowAdd(false)} className="text-gray-400 hover:text-gray-600">
+                <X size={16} />
+              </button>
+            </div>
+            <form onSubmit={handleAdd} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Hari *</label>
+                  <select
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                    value={form.day_name}
+                    onChange={e => setForm({ ...form, day_name: e.target.value })}
+                  >
+                    {SCHEDULE_DAYS.map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Jam Ke *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="12"
+                    step="1"
+                    required
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                    value={form.period_num}
+                    onChange={e => setForm({ ...form, period_num: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Jam Mulai *</label>
+                  <input
+                    type="time"
+                    required
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                    value={form.time_start}
+                    onChange={e => setForm({ ...form, time_start: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="font-semibold text-gray-700 block mb-1">Jam Selesai *</label>
+                  <input
+                    type="time"
+                    required
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                    value={form.time_end}
+                    onChange={e => setForm({ ...form, time_end: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Mata Pelajaran *</label>
+                <input
+                  type="text"
+                  required
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="Matematika Peminatan..."
+                  value={form.subject_name}
+                  onChange={e => setForm({ ...form, subject_name: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Guru Pengampu *</label>
+                <input
+                  type="text"
+                  required
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="Bambang Sutedjo, M.Pd."
+                  value={form.teacher_name}
+                  onChange={e => setForm({ ...form, teacher_name: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="font-semibold text-gray-700 block mb-1">Ruang</label>
+                <input
+                  type="text"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-[#002147] focus:outline-none"
+                  placeholder="R-101 (dipakai bila dikosongkan)"
+                  value={form.room}
+                  onChange={e => setForm({ ...form, room: e.target.value })}
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => setShowAdd(false)}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="flex items-center gap-1 px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold disabled:opacity-50"
+                >
+                  <Save size={13} /> {saving ? 'Menyimpan...' : 'Simpan Jadwal'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -1603,6 +2264,8 @@ function JurnalTab() {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState(makeJournalForm);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadJournal = () => {
     setLoading(true);
@@ -1620,6 +2283,7 @@ function JurnalTab() {
       showToast('Mata pelajaran dan materi wajib diisi!', 'error');
       return;
     }
+    setSaving(true);
     try {
       const res = await apiFetch('/journal', {
         method: 'POST',
@@ -1639,16 +2303,22 @@ function JurnalTab() {
       loadJournal();
     } catch (err) {
       showToast(err.message || 'Gagal menambah jurnal', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (id) => {
-    if (!window.confirm('Hapus entri jurnal ini?')) return;
+  const handleDelete = async (j) => {
+    if (!window.confirm(`Hapus entri jurnal ${j.subject_name} (${j.date})?`)) return;
+    setDeletingId(j.id);
     try {
-      await apiFetch(`/journal/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/journal/${j.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Entri jurnal berhasil dihapus', 'success');
       loadJournal();
     } catch (err) {
       showToast(err.message || 'Gagal menghapus jurnal', 'error');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -1682,8 +2352,9 @@ function JurnalTab() {
               <div className="flex items-center gap-2">
                 <span className="text-xs text-gray-400">Guru: <b>{j.teacher_name}</b></span>
                 <button
-                  onClick={() => handleDelete(j.id)}
-                  className="text-gray-400 hover:text-red-600 p-1"
+                  onClick={() => handleDelete(j)}
+                  disabled={deletingId === j.id}
+                  className="text-gray-400 hover:text-red-600 p-1 disabled:opacity-50"
                   title="Hapus entri"
                 >
                   <Trash2 size={13} />
@@ -1820,9 +2491,10 @@ function JurnalTab() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold"
+                  disabled={saving}
+                  className="px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded-lg font-bold disabled:opacity-50"
                 >
-                  Simpan Jurnal
+                  {saving ? 'Menyimpan...' : 'Simpan Jurnal'}
                 </button>
               </div>
             </form>
@@ -2383,6 +3055,8 @@ function P5Tab() {
     predicate: 'BSH',
     description: ''
   });
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadP5 = () => {
     setLoading(true);
@@ -2412,6 +3086,7 @@ function P5Tab() {
       showToast('Pilih siswa yang akan dinilai terlebih dahulu', 'error');
       return;
     }
+    setSaving(true);
     try {
       const res = await apiFetch('/p5', {
         method: 'POST',
@@ -2423,16 +3098,22 @@ function P5Tab() {
       loadP5();
     } catch (err) {
       showToast(err.message || 'Gagal menambah P5', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (id) => {
-    if (!window.confirm('Hapus penilaian P5 ini?')) return;
+  const handleDelete = async (p) => {
+    if (!window.confirm(`Hapus penilaian P5 ${p.student_name} (${p.project_theme})?`)) return;
+    setDeletingId(p.id);
     try {
-      await apiFetch(`/p5/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/p5/${p.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Penilaian P5 berhasil dihapus', 'success');
       loadP5();
     } catch (err) {
       showToast(err.message || 'Gagal menghapus P5', 'error');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -2466,7 +3147,12 @@ function P5Tab() {
                 <Badge color={p.predicate === 'SAB' ? 'green' : 'blue'}>
                   {p.predicate}
                 </Badge>
-                <button onClick={() => handleDelete(p.id)} className="text-gray-400 hover:text-red-600 p-1">
+                <button
+                  onClick={() => handleDelete(p)}
+                  disabled={deletingId === p.id}
+                  className="text-gray-400 hover:text-red-600 p-1 disabled:opacity-50"
+                  title="Hapus penilaian P5"
+                >
                   <Trash2 size={13} />
                 </button>
               </div>
@@ -2567,10 +3253,10 @@ function P5Tab() {
                 </button>
                 <button
                   type="submit"
-                  disabled={students.length === 0}
+                  disabled={saving || students.length === 0}
                   className="px-4 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded font-bold disabled:opacity-50"
                 >
-                  Simpan P5
+                  {saving ? 'Menyimpan...' : 'Simpan P5'}
                 </button>
               </div>
             </form>
@@ -2588,52 +3274,99 @@ function InventarisTab() {
   const { showToast } = useAuth();
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ item_name: '', quantity: 1, unit: 'Unit', condition: 'Baik', notes: '' });
+  const [showModal, setShowModal] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+  const [form, setForm] = useState(makeInventoryForm);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
 
   const loadInv = () => {
     setLoading(true);
     apiFetch('/inventory')
-      .then(setItems)
+      .then(list => setItems(Array.isArray(list) ? list : []))
       .catch(err => showToast(err.message || 'Gagal memuat data dari server', 'error'))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => { loadInv(); }, []);
 
+  const openAddModal = () => {
+    setEditItem(null);
+    setForm(makeInventoryForm());
+    setShowModal(true);
+  };
+
+  const openEditModal = (item) => {
+    setEditItem(item);
+    // PUT server menimpa item_name, quantity, unit, condition, notes → muat nilai lama ke form.
+    setForm({
+      item_name: item.item_name || '',
+      quantity: item.quantity ?? 1,
+      unit: item.unit || 'Unit',
+      condition: INVENTORY_CONDITIONS.includes(item.condition) ? item.condition : 'Baik',
+      notes: item.notes || ''
+    });
+    setShowModal(true);
+  };
+
   const handleSave = async (e) => {
     e.preventDefault();
-    if (!form.item_name.trim()) {
+    const item_name = form.item_name.trim();
+    if (!item_name) {
       showToast('Nama barang wajib diisi', 'error');
       return;
     }
+    const quantity = Number(form.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      showToast('Jumlah barang harus berupa angka bulat minimal 1', 'error');
+      return;
+    }
+    if (!INVENTORY_CONDITIONS.includes(form.condition)) {
+      showToast('Kondisi barang tidak valid', 'error');
+      return;
+    }
+    setSaving(true);
     try {
-      const res = await apiFetch('/inventory', {
-        method: 'POST',
-        body: JSON.stringify({
-          ...form,
-          item_name: form.item_name.trim(),
-          quantity: Number(form.quantity) || 1,
-          unit: form.unit.trim() || 'Unit',
-          notes: form.notes.trim() || null
-        })
-      });
-      showToast(res?.message || 'Barang inventaris berhasil ditambahkan', 'success');
-      setShowAdd(false);
-      setForm({ item_name: '', quantity: 1, unit: 'Unit', condition: 'Baik', notes: '' });
+      const payload = {
+        item_name,
+        quantity,
+        unit: form.unit.trim() || 'Unit',
+        condition: form.condition,
+        notes: form.notes.trim() || null
+      };
+      if (editItem) {
+        const res = await apiFetch(`/inventory/${editItem.id}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload)
+        });
+        showToast(res?.message || 'Inventaris berhasil diperbarui', 'success');
+      } else {
+        const res = await apiFetch('/inventory', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        showToast(res?.message || 'Barang inventaris berhasil ditambahkan', 'success');
+      }
+      setShowModal(false);
       loadInv();
     } catch (err) {
-      showToast(err.message || 'Gagal menambah inventaris', 'error');
+      showToast(err.message || 'Gagal menyimpan inventaris', 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (id) => {
-    if (!window.confirm('Hapus item inventaris ini?')) return;
+  const handleDelete = async (item) => {
+    if (!window.confirm(`Hapus "${item.item_name}" dari daftar inventaris?`)) return;
+    setDeletingId(item.id);
     try {
-      await apiFetch(`/inventory/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/inventory/${item.id}`, { method: 'DELETE' });
+      showToast(res?.message || 'Barang inventaris berhasil dihapus', 'success');
       loadInv();
     } catch (err) {
       showToast(err.message || 'Gagal menghapus inventaris', 'error');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -2647,7 +3380,7 @@ function InventarisTab() {
         desc="Pencatatan aset fisik, mebel, dan fasilitas penunjang KBM"
         action={
           <button
-            onClick={() => setShowAdd(true)}
+            onClick={openAddModal}
             className="flex items-center gap-1.5 px-4 py-2 bg-[#002147] hover:bg-blue-900 text-white rounded-lg text-xs font-semibold"
           >
             <Plus size={14} /> Tambah Barang
@@ -2665,7 +3398,7 @@ function InventarisTab() {
               <th className="px-3 py-2.5 text-center w-24">Jumlah</th>
               <th className="px-3 py-2.5 text-center w-28">Kondisi</th>
               <th className="px-3 py-2.5 text-left">Catatan / Keterangan</th>
-              <th className="px-3 py-2.5 text-center w-16">Aksi</th>
+              <th className="px-3 py-2.5 text-center w-24">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -2681,10 +3414,25 @@ function InventarisTab() {
                   </Badge>
                 </td>
                 <td className="px-3 py-2 text-gray-600">{item.notes || '-'}</td>
-                <td className="px-3 py-2 text-center">
-                  <button onClick={() => handleDelete(item.id)} className="text-gray-400 hover:text-red-600 p-1" title="Hapus barang">
-                    <Trash2 size={13} />
-                  </button>
+                <td className="px-3 py-2 text-center whitespace-nowrap">
+                  <div className="flex items-center justify-center gap-1">
+                    <button
+                      onClick={() => openEditModal(item)}
+                      disabled={deletingId === item.id}
+                      className="p-1.5 hover:bg-blue-50 text-blue-700 rounded transition-colors disabled:opacity-50"
+                      title="Edit barang"
+                    >
+                      <Edit3 size={13} />
+                    </button>
+                    <button
+                      onClick={() => handleDelete(item)}
+                      disabled={deletingId === item.id}
+                      className="p-1.5 hover:bg-red-50 text-red-600 rounded transition-colors disabled:opacity-50"
+                      title="Hapus barang"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -2699,12 +3447,16 @@ function InventarisTab() {
         </table>
       </div>
 
-      {showAdd && (
+      {/* Modal Tambah/Edit Inventaris */}
+      {showModal && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-gray-100">
             <div className="flex items-center justify-between pb-3 mb-3 border-b border-gray-100">
-              <h3 className="text-sm font-bold text-gray-900">Tambah Inventaris Kelas</h3>
-              <button onClick={() => setShowAdd(false)} className="text-gray-400 hover:text-gray-600">
+              <h3 className="text-sm font-bold text-gray-900 flex items-center gap-2">
+                <Package size={16} className="text-[#002147]" />
+                {editItem ? `Edit Inventaris — ${editItem.item_code || editItem.item_name}` : 'Tambah Inventaris Kelas'}
+              </h3>
+              <button onClick={() => setShowModal(false)} className="text-gray-400 hover:text-gray-600">
                 <X size={16} />
               </button>
             </div>
@@ -2722,13 +3474,15 @@ function InventarisTab() {
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="font-semibold text-gray-700 block mb-1">Jumlah</label>
+                  <label className="font-semibold text-gray-700 block mb-1">Jumlah *</label>
                   <input
                     type="number"
                     min="1"
+                    step="1"
+                    required
                     className="w-full border border-gray-300 rounded-lg px-3 py-2"
                     value={form.quantity}
-                    onChange={e => setForm({ ...form, quantity: Number(e.target.value) })}
+                    onChange={e => setForm({ ...form, quantity: e.target.value })}
                   />
                 </div>
                 <div>
@@ -2749,9 +3503,7 @@ function InventarisTab() {
                   value={form.condition}
                   onChange={e => setForm({ ...form, condition: e.target.value })}
                 >
-                  <option value="Baik">Baik</option>
-                  <option value="Rusak Ringan">Rusak Ringan</option>
-                  <option value="Rusak Berat">Rusak Berat</option>
+                  {INVENTORY_CONDITIONS.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
               <div>
@@ -2767,16 +3519,17 @@ function InventarisTab() {
               <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
                 <button
                   type="button"
-                  onClick={() => setShowAdd(false)}
+                  onClick={() => setShowModal(false)}
                   className="px-3 py-1.5 border border-gray-300 rounded text-gray-700"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded font-bold"
+                  disabled={saving}
+                  className="flex items-center gap-1 px-4 py-1.5 bg-[#002147] hover:bg-blue-900 text-white rounded font-bold disabled:opacity-50"
                 >
-                  Simpan Barang
+                  <Save size={13} /> {saving ? 'Menyimpan...' : (editItem ? 'Simpan Perubahan' : 'Simpan Barang')}
                 </button>
               </div>
             </form>
